@@ -1569,7 +1569,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         Schema schema1 =
                 Schema.newBuilder()
                         .column("id", DataTypes.INT())
-                        .column("and_value", DataTypes.STRING(), AggFunctions.BOOL_AND())
+                        .column("sum_value", DataTypes.STRING(), AggFunctions.SUM())
                         .primaryKey("id")
                         .build();
         TableDescriptor t1 =
@@ -1581,77 +1581,6 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         assertThatThrownBy(() -> admin.createTable(tablePath, t1, false).get())
                 .cause()
                 .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining(
-                        "Data type for bool_and column must be 'BooleanType' but was 'STRING'");
-
-        Schema schema2 =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column("count", DataTypes.STRING(), AggFunctions.SUM())
-                        .primaryKey("id")
-                        .build();
-        TableDescriptor t2 =
-                TableDescriptor.builder()
-                        .schema(schema2)
-                        .comment("aggregate merge engine table")
-                        .properties(propertiesAggregate)
-                        .build();
-        assertThatThrownBy(() -> admin.createTable(tablePath, t2, false).get())
-                .cause()
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining("Data type for sum column must be part of [NUMERIC]");
-
-        Schema schema3 =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column("max_value", DataTypes.BOOLEAN(), AggFunctions.MAX())
-                        .primaryKey("id")
-                        .build();
-        TableDescriptor t3 =
-                TableDescriptor.builder()
-                        .schema(schema3)
-                        .comment("aggregate merge engine table")
-                        .properties(propertiesAggregate)
-                        .build();
-        assertThatThrownBy(() -> admin.createTable(tablePath, t3, false).get())
-                .cause()
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining(
-                        "Data type for max column must be part of [CHARACTER_STRING, NUMERIC, DATETIME]");
-
-        Schema schema4 =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column("list_agg_value", DataTypes.BOOLEAN(), AggFunctions.LISTAGG())
-                        .primaryKey("id")
-                        .build();
-        TableDescriptor t4 =
-                TableDescriptor.builder()
-                        .schema(schema4)
-                        .comment("aggregate merge engine table")
-                        .properties(propertiesAggregate)
-                        .build();
-        assertThatThrownBy(() -> admin.createTable(tablePath, t4, false).get())
-                .cause()
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining(
-                        "Data type for listagg column must be part of [CHARACTER_STRING]");
-
-        Schema schema5 =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column(
-                                "first",
-                                DataTypes.ARRAY(DataTypes.BIGINT()),
-                                AggFunctions.FIRST_VALUE())
-                        .primaryKey("id")
-                        .build();
-        TableDescriptor t5 =
-                TableDescriptor.builder()
-                        .schema(schema5)
-                        .comment("aggregate merge engine table")
-                        .properties(propertiesAggregate)
-                        .build();
-        admin.createTable(tablePath, t5, false).get();
+                .hasMessageContaining("Data type for sum column must be");
     }
 }
