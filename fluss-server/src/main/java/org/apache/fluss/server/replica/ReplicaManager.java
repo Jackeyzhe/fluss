@@ -20,6 +20,7 @@ package org.apache.fluss.server.replica;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
@@ -29,14 +30,17 @@ import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.MetricGroup;
+import org.apache.fluss.record.KeyRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
@@ -56,7 +60,9 @@ import org.apache.fluss.rpc.messages.NotifyKvSnapshotOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyLakeTableOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
+import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.LakeBucketOffset;
@@ -84,6 +90,7 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.checkpoint.OffsetCheckpointFile;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.metadata.ClusterMetadata;
+import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.UserMetrics;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
@@ -118,6 +125,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -130,8 +138,11 @@ import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.server.TabletManagerBase.getTableInfo;
 import static org.apache.fluss.utils.FileUtils.isDirectoryEmpty;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.apache.fluss.utils.Preconditions.checkState;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
@@ -339,7 +350,8 @@ public class ReplicaManager {
                 this::physicalStorageRemoteLogSize);
     }
 
-    private Stream<Replica> onlineReplicas() {
+    @VisibleForTesting
+    public Stream<Replica> onlineReplicas() {
         return allReplicas.values().stream()
                 .map(
                         t -> {
@@ -363,6 +375,11 @@ public class ReplicaManager {
 
     private long atMinIsrCount() {
         return onlineReplicas().filter(Replica::isAtMinIsr).count();
+    }
+
+    @VisibleForTesting
+    public long leaderCount() {
+        return onlineReplicas().filter(Replica::isLeader).count();
     }
 
     private int writerIdCount() {
@@ -412,6 +429,11 @@ public class ReplicaManager {
                     List<NotifyLeaderAndIsrData> replicasToBeLeader = new ArrayList<>();
                     List<NotifyLeaderAndIsrData> replicasToBeFollower = new ArrayList<>();
                     for (NotifyLeaderAndIsrData data : notifyLeaderAndIsrDataList) {
+                        LOG.info(
+                                "Try to become leaderAndFollower for {} with isr {}, replicas: {}",
+                                data.getTableBucket(),
+                                data.getLeaderAndIsr(),
+                                data.getReplicas());
                         TableBucket tb = data.getTableBucket();
                         try {
                             boolean becomeLeader = validateAndGetIsBecomeLeader(data);
@@ -448,7 +470,35 @@ public class ReplicaManager {
                     // check or apply coordinator epoch.
                     validateAndApplyCoordinatorEpoch(coordinatorEpoch, "updateMetadataCache");
                     metadataCache.updateClusterMetadata(clusterMetadata);
+                    updateReplicaTableConfig(clusterMetadata);
                 });
+    }
+
+    private void updateReplicaTableConfig(ClusterMetadata clusterMetadata) {
+        Map<Long, Boolean> tableIdToLakeFlag = new HashMap<>();
+        for (TableMetadata tableMetadata : clusterMetadata.getTableMetadataList()) {
+            TableInfo tableInfo = tableMetadata.getTableInfo();
+            if (tableInfo.getTableConfig().getDataLakeFormat().isPresent()) {
+                long tableId = tableInfo.getTableId();
+                boolean dataLakeEnabled = tableInfo.getTableConfig().isDataLakeEnabled();
+                tableIdToLakeFlag.put(tableId, dataLakeEnabled);
+            }
+        }
+
+        if (tableIdToLakeFlag.isEmpty()) {
+            return;
+        }
+
+        for (Map.Entry<TableBucket, HostedReplica> entry : allReplicas.entrySet()) {
+            HostedReplica hostedReplica = entry.getValue();
+            if (hostedReplica instanceof OnlineReplica) {
+                Replica replica = ((OnlineReplica) hostedReplica).getReplica();
+                long tableId = replica.getTableBucket().getTableId();
+                if (tableIdToLakeFlag.containsKey(tableId)) {
+                    replica.updateIsDataLakeEnabled(tableIdToLakeFlag.get(tableId));
+                }
+            }
+        }
     }
 
     /**
@@ -507,12 +557,16 @@ public class ReplicaManager {
     /**
      * Put kv records to leader replicas of the buckets, the kv data will write to kv tablet and the
      * response callback need to wait for the cdc log to be replicated to other replicas if needed.
+     *
+     * @param apiVersion the client API version for backward compatibility validation
      */
     public void putRecordsToKv(
             int timeoutMs,
             int requiredAcks,
             Map<TableBucket, KvRecordBatch> entriesPerBucket,
             @Nullable int[] targetColumns,
+            MergeMode mergeMode,
+            short apiVersion,
             Consumer<List<PutKvResultForBucket>> responseCallback) {
         if (isRequiredAcksInvalid(requiredAcks)) {
             throw new InvalidRequiredAcksException("Invalid required acks: " + requiredAcks);
@@ -520,7 +574,7 @@ public class ReplicaManager {
 
         long startTime = System.currentTimeMillis();
         Map<TableBucket, PutKvResultForBucket> kvPutResult =
-                putToLocalKv(entriesPerBucket, targetColumns, requiredAcks);
+                putToLocalKv(entriesPerBucket, targetColumns, mergeMode, requiredAcks, apiVersion);
         LOG.debug(
                 "Put records to local kv storage and wait generate cdc log in {} ms",
                 System.currentTimeMillis() - startTime);
@@ -531,11 +585,61 @@ public class ReplicaManager {
                 timeoutMs, requiredAcks, entriesPerBucket.size(), kvPutResult, responseCallback);
     }
 
+    /** Context for tracking missing keys that need to be inserted. */
+    public static class MissingKeysContext {
+        final List<Integer> missingIndexes;
+        final List<byte[]> missingKeys;
+
+        MissingKeysContext(List<Integer> missingIndexes, List<byte[]> missingKeys) {
+            this.missingIndexes = missingIndexes;
+            this.missingKeys = missingKeys;
+        }
+    }
+
+    /**
+     * Collect missing keys from lookup results for insertion, populating both context and batch
+     * maps. And returns the schema of the table, may return null if there is no missing keys.
+     */
+    private Schema collectMissingKeysForInsert(
+            Map<TableBucket, List<byte[]>> entriesPerBucket,
+            Map<TableBucket, LookupResultForBucket> lookupResults,
+            Map<TableBucket, MissingKeysContext> missingKeysContextMap,
+            Map<TableBucket, KvRecordBatch> kvRecordBatchMap) {
+        Schema schema = null;
+        for (Map.Entry<TableBucket, List<byte[]>> entry : entriesPerBucket.entrySet()) {
+            TableBucket tb = entry.getKey();
+            LookupResultForBucket lookupResult = lookupResults.get(tb);
+            if (lookupResult.failed()) {
+                continue;
+            }
+            List<Integer> missingIndexes = new ArrayList<>();
+            List<byte[]> missingKeys = new ArrayList<>();
+            List<byte[]> requestedKeys = entry.getValue();
+            List<byte[]> lookupValues = lookupResult.lookupValues();
+
+            for (int i = 0; i < requestedKeys.size(); i++) {
+                if (lookupValues.get(i) == null) {
+                    missingKeys.add(requestedKeys.get(i));
+                    missingIndexes.add(i);
+                }
+            }
+            if (!missingKeys.isEmpty()) {
+                TableInfo tableInfo = getReplicaOrException(tb).getTableInfo();
+                missingKeysContextMap.put(tb, new MissingKeysContext(missingIndexes, missingKeys));
+                kvRecordBatchMap.put(tb, KeyRecordBatch.create(missingKeys, tableInfo));
+                schema = tableInfo.getSchema();
+            }
+        }
+        // this assumes all table buckets belong to the same table
+        return schema;
+    }
+
     /** Lookup a single key value. */
     @VisibleForTesting
     protected void lookup(TableBucket tableBucket, byte[] key, Consumer<byte[]> responseCallback) {
         lookups(
                 Collections.singletonMap(tableBucket, Collections.singletonList(key)),
+                ApiKeys.LOOKUP.highestSupportedVersion,
                 multiLookupResponseCallBack -> {
                     LookupResultForBucket result = multiLookupResponseCallBack.get(tableBucket);
                     List<byte[]> values = result.lookupValues();
@@ -548,9 +652,24 @@ public class ReplicaManager {
                 });
     }
 
-    /** Lookup with multi key from leader replica of the buckets. */
     public void lookups(
             Map<TableBucket, List<byte[]>> entriesPerBucket,
+            short apiVersion,
+            Consumer<Map<TableBucket, LookupResultForBucket>> responseCallback) {
+        lookups(false, null, null, entriesPerBucket, apiVersion, responseCallback);
+    }
+
+    /**
+     * Lookup with multi key from leader replica of the buckets.
+     *
+     * @param apiVersion the client API version for backward compatibility validation
+     */
+    public void lookups(
+            boolean insertIfNotExists,
+            @Nullable Integer timeoutMs,
+            @Nullable Integer requiredAcks,
+            Map<TableBucket, List<byte[]>> entriesPerBucket,
+            short apiVersion,
             Consumer<Map<TableBucket, LookupResultForBucket>> responseCallback) {
         Map<TableBucket, LookupResultForBucket> lookupResultForBucketMap = new HashMap<>();
         long startTime = System.currentTimeMillis();
@@ -559,6 +678,7 @@ public class ReplicaManager {
             TableBucket tb = entry.getKey();
             try {
                 Replica replica = getReplicaOrException(tb);
+                validateClientVersionForPkTable(apiVersion, replica.getTableInfo());
                 tableMetrics = replica.tableMetrics();
                 tableMetrics.totalLookupRequests().inc();
                 lookupResultForBucketMap.put(
@@ -577,13 +697,105 @@ public class ReplicaManager {
                         tb, new LookupResultForBucket(tb, ApiError.fromThrowable(e)));
             }
         }
+
+        if (insertIfNotExists) {
+            // Lookup-with-insert-if-not-exists flow:
+            // 1. Initial lookup may find some keys missing
+            // 2. For missing keys, we call putKv to insert them
+            // 3. Concurrent lookups on the same keys may all see them as missing, leading to
+            //    multiple putKv calls for the same keys (becomes UPDATE operations in
+            // processUpsert)
+            // 4. Auto-increment columns are excluded from targetColumns to prevent overwriting
+            checkArgument(
+                    timeoutMs != null && requiredAcks != null,
+                    "timeoutMs and requiredAcks must be set");
+
+            Map<TableBucket, MissingKeysContext> entriesPerBucketToInsert = new HashMap<>();
+            Map<TableBucket, KvRecordBatch> produceEntryData = new HashMap<>();
+            Schema schema =
+                    collectMissingKeysForInsert(
+                            entriesPerBucket,
+                            lookupResultForBucketMap,
+                            entriesPerBucketToInsert,
+                            produceEntryData);
+
+            if (!produceEntryData.isEmpty()) {
+                checkNotNull(schema, "Schema must be available for insert-if-not-exists");
+                // TODO: Performance optimization: during lookup-with-insert-if-not-exists flow,
+                // the original key bytes are wrapped in KeyRecordBatch, then during putRecordsToKv
+                // they are decoded to rows and immediately re-encoded back to key bytes, causing
+                // redundant encode/decode overhead.
+                putRecordsToKv(
+                        timeoutMs,
+                        requiredAcks,
+                        produceEntryData,
+                        schema.getPrimaryKeyIndexes(),
+                        MergeMode.DEFAULT,
+                        apiVersion,
+                        (result) ->
+                                responseCallback.accept(
+                                        reLookupAndMerge(
+                                                result,
+                                                entriesPerBucketToInsert,
+                                                lookupResultForBucketMap)));
+            } else {
+                // All keys exist, directly return lookup results
+                responseCallback.accept(lookupResultForBucketMap);
+            }
+        } else {
+            responseCallback.accept(lookupResultForBucketMap);
+        }
         LOG.debug("Lookup from local kv in {}ms", System.currentTimeMillis() - startTime);
-        responseCallback.accept(lookupResultForBucketMap);
     }
 
-    /** Lookup multi prefixKeys by prefix scan on kv store. */
+    /**
+     * Re-lookup missing keys after insert and merge results back into the original lookup result
+     * map.
+     */
+    private Map<TableBucket, LookupResultForBucket> reLookupAndMerge(
+            List<PutKvResultForBucket> putKvResultForBucketList,
+            Map<TableBucket, MissingKeysContext> entriesPerBucketToInsert,
+            Map<TableBucket, LookupResultForBucket> lookupResultForBucketMap) {
+        // Collect failed buckets first to avoid unnecessary re-lookup
+        Set<TableBucket> failedBuckets = new HashSet<>();
+        for (PutKvResultForBucket putKvResultForBucket : putKvResultForBucketList) {
+            if (putKvResultForBucket.failed()) {
+                TableBucket tb = putKvResultForBucket.getTableBucket();
+                failedBuckets.add(tb);
+                lookupResultForBucketMap.put(
+                        tb, new LookupResultForBucket(tb, putKvResultForBucket.getError()));
+            }
+        }
+
+        // Re-lookup only for successful inserts
+        for (Map.Entry<TableBucket, MissingKeysContext> entry :
+                entriesPerBucketToInsert.entrySet()) {
+            TableBucket tb = entry.getKey();
+            if (failedBuckets.contains(tb)) {
+                continue; // Skip buckets that failed during insert
+            }
+            MissingKeysContext missingKeysContext = entry.getValue();
+            List<byte[]> results =
+                    getReplicaOrException(tb).lookups(missingKeysContext.missingKeys);
+            LookupResultForBucket lookupResult = lookupResultForBucketMap.get(tb);
+            for (int i = 0; i < missingKeysContext.missingIndexes.size(); i++) {
+                lookupResult
+                        .lookupValues()
+                        .set(missingKeysContext.missingIndexes.get(i), results.get(i));
+            }
+        }
+
+        return lookupResultForBucketMap;
+    }
+
+    /**
+     * Lookup multi prefixKeys by prefix scan on kv store.
+     *
+     * @param apiVersion the client API version for backward compatibility validation
+     */
     public void prefixLookups(
             Map<TableBucket, List<byte[]>> entriesPerBucket,
+            short apiVersion,
             Consumer<Map<TableBucket, PrefixLookupResultForBucket>> responseCallback) {
         TableMetricGroup tableMetrics = null;
         Map<TableBucket, PrefixLookupResultForBucket> result = new HashMap<>();
@@ -592,6 +804,7 @@ public class ReplicaManager {
             List<List<byte[]>> resultForBucket = new ArrayList<>();
             try {
                 Replica replica = getReplicaOrException(tb);
+                validateClientVersionForPkTable(apiVersion, replica.getTableInfo());
                 tableMetrics = replica.tableMetrics();
                 tableMetrics.totalPrefixLookupRequests().inc();
                 for (byte[] prefixKey : entry.getValue()) {
@@ -687,7 +900,8 @@ public class ReplicaManager {
                                     result.add(
                                             stopReplica(
                                                     tb,
-                                                    data.isDelete(),
+                                                    data.isDeleteLocal(),
+                                                    data.isDeleteRemote(),
                                                     deletedTableIds,
                                                     deletedPartitionIds));
                                 } catch (Exception e) {
@@ -987,7 +1201,9 @@ public class ReplicaManager {
     private Map<TableBucket, PutKvResultForBucket> putToLocalKv(
             Map<TableBucket, KvRecordBatch> entriesPerBucket,
             @Nullable int[] targetColumns,
-            int requiredAcks) {
+            MergeMode mergeMode,
+            int requiredAcks,
+            short apiVersion) {
         Map<TableBucket, PutKvResultForBucket> putResultForBucketMap = new HashMap<>();
         for (Map.Entry<TableBucket, KvRecordBatch> entry : entriesPerBucket.entrySet()) {
             TableBucket tb = entry.getKey();
@@ -995,10 +1211,12 @@ public class ReplicaManager {
             try {
                 LOG.trace("Put records to local kv tablet for table bucket {}", tb);
                 Replica replica = getReplicaOrException(tb);
+                validateClientVersionForPkTable(apiVersion, replica.getTableInfo());
                 tableMetrics = replica.tableMetrics();
                 tableMetrics.totalPutKvRequests().inc();
                 LogAppendInfo appendInfo =
-                        replica.putRecordsToLeader(entry.getValue(), targetColumns, requiredAcks);
+                        replica.putRecordsToLeader(
+                                entry.getValue(), targetColumns, mergeMode, requiredAcks);
                 LOG.trace(
                         "Written to local kv for {}, and the cdc log beginning at offset {} and ending at offset {}",
                         tb,
@@ -1494,10 +1712,23 @@ public class ReplicaManager {
         }
     }
 
-    /** Stop the given replica. */
+    /**
+     * Stop the replica for the given table bucket.
+     *
+     * @param tb the table bucket
+     * @param deleteLocal whether to delete the local data, this will be true not only the table or
+     *     partition of the table bucket already deleted or the replica is migrated to another
+     *     server by rebalance
+     * @param deleteRemote whether to delete the remote data, like remote log and kv snapshot, this
+     *     means the table or partition of the table bucket already deleted
+     * @param deletedTableIds the table ids that are deleted
+     * @param deletedPartitionIds the partition ids that are deleted
+     * @return the result of stop replica
+     */
     private StopReplicaResultForBucket stopReplica(
             TableBucket tb,
-            boolean delete,
+            boolean deleteLocal,
+            boolean deleteRemote,
             Map<Long, Path> deletedTableIds,
             Map<Long, Path> deletedPartitionIds) {
         // First stop fetchers for this table bucket.
@@ -1506,7 +1737,7 @@ public class ReplicaManager {
         HostedReplica replica = getReplica(tb);
         if (replica instanceof OnlineReplica) {
             Replica replicaToDelete = ((OnlineReplica) replica).getReplica();
-            if (delete) {
+            if (deleteLocal) {
                 if (allReplicas.remove(tb) != null) {
                     serverMetricGroup.removeTableBucketMetricGroup(
                             replicaToDelete.getPhysicalTablePath().getTablePath(), tb);
@@ -1521,8 +1752,9 @@ public class ReplicaManager {
                 }
             }
 
-            remoteLogManager.stopReplica(replicaToDelete, delete && replicaToDelete.isLeader());
-            if (delete && replicaToDelete.isLeader()) {
+            remoteLogManager.stopReplica(
+                    replicaToDelete, deleteRemote && replicaToDelete.isLeader());
+            if (deleteRemote && replicaToDelete.isLeader()) {
                 kvManager.deleteRemoteKvSnapshot(
                         replicaToDelete.getPhysicalTablePath(), replicaToDelete.getTableBucket());
             }
@@ -1704,6 +1936,29 @@ public class ReplicaManager {
 
         // Checkpoint highWatermark.
         checkpointHighWatermarks();
+    }
+
+    private void validateClientVersionForPkTable(int apiVersion, TableInfo tableInfo) {
+        if (apiVersion > 0) {
+            return;
+        }
+
+        // in the old version
+        TableConfig tableConfig = tableInfo.getTableConfig();
+        // is with datalake format
+        if (tableConfig.getDataLakeFormat().isPresent()) {
+            Optional<Integer> kvFormatVersion = tableConfig.getKvFormatVersion();
+            if (kvFormatVersion.isPresent()
+                    && kvFormatVersion.get() == KV_FORMAT_VERSION_2
+                    && !tableInfo.isDefaultBucketKey()) {
+                throw new UnsupportedVersionException(
+                        String.format(
+                                "Client API version %d is not supported for table '%s'. "
+                                        + "This table uses new key encoding strategy (kv format version %d). "
+                                        + "Please upgrade your Fluss client to a newer version.",
+                                apiVersion, tableInfo.getTablePath(), kvFormatVersion.get()));
+            }
+        }
     }
 
     /** The result of reading log. */

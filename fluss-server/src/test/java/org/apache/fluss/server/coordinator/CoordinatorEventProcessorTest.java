@@ -19,6 +19,8 @@ package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.cluster.Endpoint;
 import org.apache.fluss.cluster.TabletServerInfo;
+import org.apache.fluss.cluster.rebalance.RebalancePlanForBucket;
+import org.apache.fluss.cluster.rebalance.RebalanceStatus;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FencedLeaderEpochException;
@@ -51,6 +53,7 @@ import org.apache.fluss.server.coordinator.statemachine.ReplicaState;
 import org.apache.fluss.server.entity.AdjustIsrResultForBucket;
 import org.apache.fluss.server.entity.CommitKvSnapshotData;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
+import org.apache.fluss.server.entity.TablePropertyChanges;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.metadata.BucketMetadata;
@@ -69,6 +72,7 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
+import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.server.zk.data.ZkData.PartitionIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
@@ -448,6 +452,9 @@ class CoordinatorEventProcessorTest {
 
         t2Bucket0State = fromCtx(ctx -> ctx.getBucketState(t2Bucket0));
         assertThat(t2Bucket0State).isEqualTo(OnlineBucket);
+
+        // clean up the tablet server 3
+        ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupPath(ZkData.ServerIdZNode.path(3));
     }
 
     @Test
@@ -900,6 +907,139 @@ class CoordinatorEventProcessorTest {
                                 3, new TableMetadata(tableInfo2, Collections.emptyList())));
     }
 
+    @Test
+    void testTableRegistrationChange() throws Exception {
+        // make sure all request to gateway should be successful
+        initCoordinatorChannel();
+
+        // create a table
+        TablePath t1 = TablePath.of(defaultDatabase, "test_table_registration_change");
+        int nBuckets = 1;
+        int replicationFactor = 3;
+        TableAssignment tableAssignment =
+                generateAssignment(
+                        nBuckets,
+                        replicationFactor,
+                        new TabletServerInfo[] {
+                            new TabletServerInfo(0, "rack0"),
+                            new TabletServerInfo(1, "rack1"),
+                            new TabletServerInfo(2, "rack2")
+                        });
+        // create table
+        List<Integer> replicas = tableAssignment.getBucketAssignment(0).getReplicas();
+        metadataManager.createTable(t1, TEST_TABLE, tableAssignment, false);
+        TableInfo tableInfo = metadataManager.getTable(t1);
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        verifyMetadataUpdateRequest(
+                                3,
+                                new TableMetadata(
+                                        tableInfo,
+                                        Collections.singletonList(
+                                                new BucketMetadata(
+                                                        0, replicas.get(0), 0, replicas)))));
+
+        // alter table properties (custom property)
+        TablePropertyChanges.Builder builder = TablePropertyChanges.builder();
+        builder.setCustomProperty("custom.key", "custom.value");
+        TablePropertyChanges tablePropertyChanges = builder.build();
+        metadataManager.alterTableProperties(
+                t1, Collections.emptyList(), tablePropertyChanges, false, null);
+
+        // get updated table info and verify metadata update request is sent
+        TableInfo updatedTableInfo = metadataManager.getTable(t1);
+        assertThat(updatedTableInfo.getCustomProperties().toMap())
+                .containsEntry("custom.key", "custom.value");
+
+        retry(
+                Duration.ofMinutes(1),
+                () ->
+                        verifyMetadataUpdateRequest(
+                                3, new TableMetadata(updatedTableInfo, Collections.emptyList())));
+
+        // verify the table info in coordinator context is updated
+        retryVerifyContext(
+                ctx -> {
+                    Long tableId = ctx.getTableIdByPath(t1);
+                    assertThat(tableId).isNotNull();
+                    TableInfo tableInfoInCtx = ctx.getTableInfoById(tableId);
+                    assertThat(tableInfoInCtx).isNotNull();
+                    assertThat(tableInfoInCtx.getCustomProperties().toMap())
+                            .containsEntry("custom.key", "custom.value");
+                });
+    }
+
+    @Test
+    void testDoBucketReassignment() throws Exception {
+        zookeeperClient.registerTabletServer(
+                3,
+                new TabletServerRegistration(
+                        "rack3",
+                        Collections.singletonList(
+                                new Endpoint("host3", 1001, DEFAULT_LISTENER_NAME)),
+                        System.currentTimeMillis()));
+
+        initCoordinatorChannel();
+        TablePath t1 = TablePath.of(defaultDatabase, "test_bucket_reassignment_table");
+        // Mock un-balanced table assignment.
+        Map<Integer, BucketAssignment> bucketAssignments = new HashMap<>();
+        bucketAssignments.put(0, BucketAssignment.of(0, 1, 3));
+        TableAssignment tableAssignment = new TableAssignment(bucketAssignments);
+        long t1Id =
+                metadataManager.createTable(
+                        t1, CoordinatorEventProcessorTest.TEST_TABLE, tableAssignment, false);
+        TableBucket tb0 = new TableBucket(t1Id, 0);
+        verifyIsr(tb0, 0, Arrays.asList(0, 1, 3));
+
+        // trigger bucket reassignment for tb0:
+        // bucket0 -> (0, 1, 2)
+        Map<TableBucket, RebalancePlanForBucket> rebalancePlan = new HashMap<>();
+        RebalancePlanForBucket planForBucket0 =
+                new RebalancePlanForBucket(
+                        tb0, 0, 0, Arrays.asList(0, 1, 3), Arrays.asList(0, 1, 2));
+
+        rebalancePlan.put(tb0, planForBucket0);
+        // try to execute.
+        eventProcessor
+                .getRebalanceManager()
+                .registerRebalance(
+                        "rebalance-task-jdsds1", rebalancePlan, RebalanceStatus.NOT_STARTED);
+
+        // Mock to finish rebalance tasks, in production case, this need to be trigged by receiving
+        // AdjustIsrRequest.
+        Map<TableBucket, LeaderAndIsr> leaderAndIsrMap = new HashMap<>();
+        CompletableFuture<AdjustIsrResponse> respCallback = new CompletableFuture<>();
+
+        // This isr list equals originReplicas + addingReplicas. the bucket epoch is 1.
+        leaderAndIsrMap.put(tb0, new LeaderAndIsr(0, 0, Arrays.asList(0, 1, 2, 3), 0, 1));
+        eventProcessor
+                .getCoordinatorEventManager()
+                .put(new AdjustIsrReceivedEvent(leaderAndIsrMap, respCallback));
+        respCallback.get();
+        verifyIsr(tb0, 0, Arrays.asList(0, 1, 2));
+
+        // clean up the tablet server 3
+        ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupPath(ZkData.ServerIdZNode.path(3));
+    }
+
+    private void verifyIsr(TableBucket tb, int expectedLeader, List<Integer> expectedIsr)
+            throws Exception {
+        LeaderAndIsr leaderAndIsr =
+                waitValue(
+                        () -> fromCtx((ctx) -> ctx.getBucketLeaderAndIsr(tb)),
+                        Duration.ofMinutes(1),
+                        "leader not elected");
+        LeaderAndIsr newLeaderAndIsrOfZk = zookeeperClient.getLeaderAndIsr(tb).get();
+        assertThat(leaderAndIsr.leader())
+                .isEqualTo(newLeaderAndIsrOfZk.leader())
+                .isEqualTo(expectedLeader);
+        assertThat(leaderAndIsr.isr())
+                .isEqualTo(newLeaderAndIsrOfZk.isr())
+                .hasSameElementsAs(expectedIsr);
+    }
+
     private CoordinatorEventProcessor buildCoordinatorEventProcessor() {
         return new CoordinatorEventProcessor(
                 zookeeperClient,
@@ -1230,7 +1370,7 @@ class CoordinatorEventProcessorTest {
     }
 
     private void alterTable(TablePath tablePath, List<TableChange> schemaChanges) {
-        metadataManager.alterTableSchema(tablePath, schemaChanges, true, null, null);
+        metadataManager.alterTableSchema(tablePath, schemaChanges, true, null);
     }
 
     private TableDescriptor getPartitionedTable() {

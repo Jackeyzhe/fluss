@@ -65,6 +65,15 @@ public class TableConfig {
         return config.get(ConfigOptions.TABLE_KV_FORMAT);
     }
 
+    /**
+     * Gets the kv format version of the table. This is used for backward compatibility when
+     * encoding strategy changes. Returns empty if the table was created before the version was
+     * introduced (old tables).
+     */
+    public Optional<Integer> getKvFormatVersion() {
+        return config.getOptional(ConfigOptions.TABLE_KV_FORMAT_VERSION);
+    }
+
     /** Gets the log TTL of the table. */
     public long getLogTTLMs() {
         return config.get(ConfigOptions.TABLE_LOG_TTL).toMillis();
@@ -139,5 +148,10 @@ public class TableConfig {
     /** Gets the auto partition strategy of the table. */
     public AutoPartitionStrategy getAutoPartitionStrategy() {
         return AutoPartitionStrategy.from(config);
+    }
+
+    /** Gets the number of auto-increment IDs cached per segment. */
+    public long getAutoIncrementCacheSize() {
+        return config.get(ConfigOptions.TABLE_AUTO_INCREMENT_CACHE_SIZE);
     }
 }

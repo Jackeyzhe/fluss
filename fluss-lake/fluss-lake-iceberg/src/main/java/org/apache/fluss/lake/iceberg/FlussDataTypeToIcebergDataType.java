@@ -23,6 +23,7 @@ import org.apache.fluss.types.BinaryType;
 import org.apache.fluss.types.BooleanType;
 import org.apache.fluss.types.BytesType;
 import org.apache.fluss.types.CharType;
+import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypeVisitor;
 import org.apache.fluss.types.DateType;
 import org.apache.fluss.types.DecimalType;
@@ -40,6 +41,9 @@ import org.apache.fluss.types.TinyIntType;
 
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /** Convert from Fluss's data type to Iceberg's data type. */
 public class FlussDataTypeToIcebergDataType implements DataTypeVisitor<Type> {
@@ -163,11 +167,45 @@ public class FlussDataTypeToIcebergDataType implements DataTypeVisitor<Type> {
 
     @Override
     public Type visit(MapType mapType) {
-        throw new UnsupportedOperationException("Unsupported map type");
+        // According to the Iceberg spec,
+        // the key and value fields of a map should have consecutive IDs
+        int keyFieldId = getNextId();
+        int valueFieldId = getNextId();
+
+        Type keyType = mapType.getKeyType().accept(this);
+        Type valueType = mapType.getValueType().accept(this);
+
+        if (mapType.getValueType().isNullable()) {
+            return Types.MapType.ofOptional(keyFieldId, valueFieldId, keyType, valueType);
+        } else {
+            return Types.MapType.ofRequired(keyFieldId, valueFieldId, keyType, valueType);
+        }
     }
 
     @Override
     public Type visit(RowType rowType) {
-        throw new UnsupportedOperationException("Unsupported row type");
+        List<Types.NestedField> fields = new ArrayList<>();
+
+        for (DataField field : rowType.getFields()) {
+            Type fieldType = field.getType().accept(this);
+
+            if (field.getType().isNullable()) {
+                fields.add(
+                        Types.NestedField.optional(
+                                getNextId(),
+                                field.getName(),
+                                fieldType,
+                                field.getDescription().orElse(null)));
+            } else {
+                fields.add(
+                        Types.NestedField.required(
+                                getNextId(),
+                                field.getName(),
+                                fieldType,
+                                field.getDescription().orElse(null)));
+            }
+        }
+
+        return Types.StructType.of(fields);
     }
 }

@@ -240,7 +240,8 @@ public class CoordinatorRequestBatch {
     public void addStopReplicaRequestForTabletServers(
             Set<Integer> tabletServers,
             TableBucket tableBucket,
-            boolean isDelete,
+            boolean deleteLocal,
+            boolean deleteRemote,
             int leaderEpoch) {
         tabletServers.stream()
                 .filter(s -> s >= 0)
@@ -250,12 +251,18 @@ public class CoordinatorRequestBatch {
                                     stopReplicaRequestMap.computeIfAbsent(id, k -> new HashMap<>());
                             // reduce delete flag, if it has been marked as deleted,
                             // we will set it as delete replica
-                            boolean alreadyDelete =
+                            boolean alreadyDeleteLocal =
                                     stopBucketReplica.get(tableBucket) != null
                                             && stopBucketReplica.get(tableBucket).isDelete();
+                            boolean alreadyDeleteRemote =
+                                    stopBucketReplica.get(tableBucket) != null
+                                            && stopBucketReplica.get(tableBucket).isDeleteRemote();
                             PbStopReplicaReqForBucket protoStopReplicaForBucket =
                                     makeStopBucketReplica(
-                                            tableBucket, alreadyDelete || isDelete, leaderEpoch);
+                                            tableBucket,
+                                            alreadyDeleteLocal || deleteLocal,
+                                            alreadyDeleteRemote || deleteRemote,
+                                            leaderEpoch);
                             stopBucketReplica.put(tableBucket, protoStopReplicaForBucket);
                         });
     }
@@ -280,6 +287,7 @@ public class CoordinatorRequestBatch {
      *   <li>case8: One newly tabletServer added into cluster
      *   <li>case9: One tabletServer is removed from cluster
      *   <li>case10: schemaId is changed after table is created.
+     *   <li>case 11: TableRegistration changed after table is created.
      * </ol>
      */
     // todo: improve this with different phase enum.
@@ -300,7 +308,7 @@ public class CoordinatorRequestBatch {
                         .computeIfAbsent(tableId, k -> new HashMap<>())
                         .put(partitionId, Collections.emptyList());
             } else {
-                // case3, case4, case10
+                // case3, case4, case10, case 11
                 updateMetadataRequestBucketMap.put(tableId, Collections.emptyList());
             }
         } else {
@@ -446,7 +454,7 @@ public class CoordinatorRequestBatch {
             // we collect the buckets whose replica is to be deleted
             Set<TableBucket> deletedReplicaBuckets =
                     stopReplicas.values().stream()
-                            .filter(PbStopReplicaReqForBucket::isDelete)
+                            .filter(pbBucket -> pbBucket.isDelete() && pbBucket.isDeleteRemote())
                             .map(t -> toTableBucket(t.getTableBucket()))
                             .collect(Collectors.toSet());
 

@@ -23,10 +23,8 @@ import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
-import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
-import org.apache.fluss.flink.tiering.event.TieringFailOverEvent;
 import org.apache.fluss.flink.tiering.source.TableBucketWriteResult;
 import org.apache.fluss.flink.tiering.source.TieringSource;
 import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
@@ -34,18 +32,16 @@ import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.utils.ExceptionUtils;
 
 import org.apache.flink.runtime.operators.coordination.OperatorEventGateway;
 import org.apache.flink.runtime.source.event.SourceEventWrapper;
-import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
-import org.apache.flink.streaming.api.operators.Output;
 import org.apache.flink.streaming.api.operators.StreamOperatorParameters;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
-import org.apache.flink.streaming.runtime.tasks.StreamTask;
 
 import javax.annotation.Nullable;
 
@@ -107,29 +103,14 @@ public class TieringCommitOperator<WriteResult, Committable>
         this.collectedTableBucketWriteResults = new HashMap<>();
         this.flussConfig = flussConf;
         this.lakeTieringConfig = lakeTieringConfig;
-        this.operatorEventGateway =
-                parameters
-                        .getOperatorEventDispatcher()
-                        .getOperatorEventGateway(TieringSource.TIERING_SOURCE_OPERATOR_UID);
         this.setup(
                 parameters.getContainingTask(),
                 parameters.getStreamConfig(),
                 parameters.getOutput());
-    }
-
-    @Override
-    public void setup(
-            StreamTask<?, ?> containingTask,
-            StreamConfig config,
-            Output<StreamRecord<CommittableMessage<Committable>>> output) {
-        super.setup(containingTask, config, output);
-        int attemptNumber = RuntimeContextAdapter.getAttemptNumber(getRuntimeContext());
-        if (attemptNumber > 0) {
-            LOG.info("Send TieringFailoverEvent, current attempt number: {}", attemptNumber);
-            // attempt number is greater than zero, the job must failover
-            operatorEventGateway.sendEventToCoordinator(
-                    new SourceEventWrapper(new TieringFailOverEvent()));
-        }
+        this.operatorEventGateway =
+                parameters
+                        .getOperatorEventDispatcher()
+                        .getOperatorEventGateway(TieringSource.TIERING_SOURCE_OPERATOR_UID);
     }
 
     @Override
@@ -197,14 +178,30 @@ public class TieringCommitOperator<WriteResult, Committable>
         // empty, means all write result is null, which is a empty commit,
         // return null to skip the empty commit
         if (committableWriteResults.isEmpty()) {
+            LOG.info(
+                    "Commit tiering write results is empty for table {}, table path {}",
+                    tableId,
+                    tablePath);
             return null;
         }
+
+        // Check if the table was dropped and recreated during tiering.
+        // If the current table id differs from the committable's table id, fail this commit
+        // to avoid dirty commit to a newly created table.
+        TableInfo currentTableInfo = admin.getTableInfo(tablePath).get();
+        if (currentTableInfo.getTableId() != tableId) {
+            throw new IllegalStateException(
+                    String.format(
+                            "The current table id %s for table path %s is different from the table id %s in the committable. "
+                                    + "This usually happens when a table was dropped and recreated during tiering. "
+                                    + "Aborting commit to prevent dirty commit.",
+                            currentTableInfo.getTableId(), tablePath, tableId));
+        }
+
         try (LakeCommitter<WriteResult, Committable> lakeCommitter =
                 lakeTieringFactory.createLakeCommitter(
                         new TieringCommitterInitContext(
-                                tablePath,
-                                admin.getTableInfo(tablePath).get(),
-                                lakeTieringConfig))) {
+                                tablePath, currentTableInfo, lakeTieringConfig))) {
             List<WriteResult> writeResults =
                     committableWriteResults.stream()
                             .map(TableBucketWriteResult::writeResult)

@@ -27,6 +27,7 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidTableException;
+import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -65,6 +66,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
 import static org.apache.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
 import static org.apache.fluss.flink.FlinkConnectorOptions.BUCKET_KEY;
@@ -290,6 +292,13 @@ abstract class FlinkCatalogITCase {
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessage(
                         "Property 'paimon.file.format' is not supported to alter which is for datalake table.");
+
+        String unSupportedDml7 =
+                "alter table test_alter_table_append_only set ('auto-increment.fields' = 'b')";
+        assertThatThrownBy(() -> tEnv.executeSql(unSupportedDml7))
+                .rootCause()
+                .isInstanceOf(CatalogException.class)
+                .hasMessage("The option 'auto-increment.fields' is not supported to alter yet.");
     }
 
     @Test
@@ -627,6 +636,8 @@ abstract class FlinkCatalogITCase {
             Map<String, String> expectedTableProperties = new HashMap<>();
             expectedTableProperties.put("table.datalake.format", "paimon");
             expectedTableProperties.put("table.replication.factor", "1");
+            expectedTableProperties.put(
+                    "table.kv.format-version", String.valueOf(CURRENT_KV_FORMAT_VERSION));
             assertThat(tableInfo.getProperties().toMap()).isEqualTo(expectedTableProperties);
 
             Map<String, String> expectedCustomProperties = new HashMap<>();
@@ -750,20 +761,11 @@ abstract class FlinkCatalogITCase {
                 "create table test_table_other_unknown_options (a int, b int)"
                         + " with ('connector' = 'fluss', 'bootstrap.servers' = 'localhost:9092', 'other.unknown.option' = 'other-unknown-val')");
 
-        // test invalid table as source
-        assertThatThrownBy(() -> tEnv.explainSql("select * from test_table_other_unknown_options"))
-                .cause()
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("Unsupported options found for 'fluss'");
+        // test table with unknown option as source
+        tEnv.explainSql("select * from test_table_other_unknown_options");
 
-        // test invalid table as sink
-        assertThatThrownBy(
-                        () ->
-                                tEnv.explainSql(
-                                        "insert into test_table_other_unknown_options values (1, 2)"))
-                .cause()
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("Unsupported options found for 'fluss'");
+        // test table with unknown option as sink
+        tEnv.explainSql("insert into test_table_other_unknown_options values (1, 2)");
     }
 
     @Test
@@ -878,6 +880,111 @@ abstract class FlinkCatalogITCase {
                 .containsEntry("table.datalake.paimon.jdbc.password", "pass");
     }
 
+    @Test
+    void testGetChangelogVirtualTable() throws Exception {
+        // Create a primary key table
+        tEnv.executeSql(
+                "CREATE TABLE pk_table_for_changelog ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  amount BIGINT,"
+                        + "  PRIMARY KEY (id, name) NOT ENFORCED"
+                        + ") PARTITIONED BY (name) "
+                        + "WITH ('bucket.num' = '1')");
+
+        // Get the $changelog virtual table via catalog API
+        CatalogTable changelogTable =
+                (CatalogTable)
+                        catalog.getTable(
+                                new ObjectPath(DEFAULT_DB, "pk_table_for_changelog$changelog"));
+
+        // Build expected schema: metadata columns + original columns
+        Schema expectedSchema =
+                Schema.newBuilder()
+                        .column("_change_type", DataTypes.STRING().notNull())
+                        .column("_log_offset", DataTypes.BIGINT().notNull())
+                        .column("_commit_timestamp", DataTypes.TIMESTAMP_LTZ(3).notNull())
+                        .column("id", DataTypes.INT().notNull())
+                        .column("name", DataTypes.STRING().notNull())
+                        .column("amount", DataTypes.BIGINT())
+                        .build();
+
+        assertThat(changelogTable.getUnresolvedSchema()).isEqualTo(expectedSchema);
+        assertThat(changelogTable.getPartitionKeys()).isEqualTo(Collections.singletonList("name"));
+
+        // Verify options are inherited from base table
+        assertThat(changelogTable.getOptions()).containsEntry("bucket.num", "1");
+
+        // Verify $changelog log tables (append-only with insert change type)
+        tEnv.executeSql("CREATE TABLE log_table_for_changelog (id INT, name STRING)");
+
+        CatalogTable logChangelogTable =
+                (CatalogTable)
+                        catalog.getTable(
+                                new ObjectPath(DEFAULT_DB, "log_table_for_changelog$changelog"));
+
+        // Log table changelog should have same metadata columns
+        Schema expectedLogSchema =
+                Schema.newBuilder()
+                        .column("_change_type", DataTypes.STRING().notNull())
+                        .column("_log_offset", DataTypes.BIGINT().notNull())
+                        .column("_commit_timestamp", DataTypes.TIMESTAMP_LTZ(3).notNull())
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .build();
+
+        assertThat(logChangelogTable.getUnresolvedSchema()).isEqualTo(expectedLogSchema);
+    }
+
+    @Test
+    void testGetBinlogVirtualTable() throws Exception {
+        // Create a primary key table with partition
+        tEnv.executeSql(
+                "CREATE TABLE pk_table_for_binlog ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING NOT NULL,"
+                        + "  amount BIGINT,"
+                        + "  PRIMARY KEY (id, name) NOT ENFORCED"
+                        + ") PARTITIONED BY (name) "
+                        + "WITH ('bucket.num' = '1')");
+
+        // Get the $binlog virtual table via catalog API
+        CatalogTable binlogTable =
+                (CatalogTable)
+                        catalog.getTable(new ObjectPath(DEFAULT_DB, "pk_table_for_binlog$binlog"));
+
+        // use string representation for assertion to simplify the unresolved schema comparison
+        assertThat(binlogTable.getUnresolvedSchema().toString())
+                .isEqualTo(
+                        "(\n"
+                                + "  `_change_type` STRING NOT NULL,\n"
+                                + "  `_log_offset` BIGINT NOT NULL,\n"
+                                + "  `_commit_timestamp` TIMESTAMP_LTZ(3) NOT NULL,\n"
+                                + "  `before` [ROW<id INT NOT NULL, name STRING NOT NULL, amount BIGINT>],\n"
+                                + "  `after` [ROW<id INT NOT NULL, name STRING NOT NULL, amount BIGINT>]\n"
+                                + ")");
+
+        // Binlog virtual tables have empty partition keys (columns are nested)
+        assertThat(binlogTable.getPartitionKeys()).isEmpty();
+
+        // Partition info is stored as an internal boolean flag
+        assertThat(binlogTable.getOptions())
+                .containsEntry(FlinkConnectorOptions.INTERNAL_BINLOG_IS_PARTITIONED.key(), "true");
+
+        // Verify options are inherited from base table
+        assertThat(binlogTable.getOptions()).containsEntry("bucket.num", "1");
+
+        // Verify $binlog is NOT supported for log tables (no primary key)
+        tEnv.executeSql("CREATE TABLE log_table_for_binlog (id INT, name STRING)");
+
+        assertThatThrownBy(
+                        () ->
+                                catalog.getTable(
+                                        new ObjectPath(DEFAULT_DB, "log_table_for_binlog$binlog")))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("only supported for primary key tables");
+    }
+
     /**
      * Before Flink 2.1, the {@link Schema} did not include an index field. Starting from Flink 2.1,
      * Flink introduced the concept of an index, and in Fluss, the primary key is considered as an
@@ -889,6 +996,7 @@ abstract class FlinkCatalogITCase {
             Map<String, String> actualOptions, Map<String, String> expectedOptions) {
         actualOptions.remove(ConfigOptions.BOOTSTRAP_SERVERS.key());
         actualOptions.remove(ConfigOptions.TABLE_REPLICATION_FACTOR.key());
+        actualOptions.remove(ConfigOptions.TABLE_KV_FORMAT_VERSION.key());
         assertThat(actualOptions).isEqualTo(expectedOptions);
     }
 }

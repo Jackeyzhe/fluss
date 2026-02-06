@@ -37,6 +37,7 @@ import org.apache.fluss.exception.TooManyPartitionsException;
 import org.apache.fluss.lake.lakestorage.LakeCatalog;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
+import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaInfo;
@@ -45,6 +46,7 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.security.acl.FlussPrincipal;
 import org.apache.fluss.server.entity.TablePropertyChanges;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.DatabaseRegistration;
@@ -164,6 +166,12 @@ public class MetadataManager {
 
     public List<String> listDatabases() {
         return uncheck(zookeeperClient::listDatabases, "Fail to list database");
+    }
+
+    public List<DatabaseSummary> listDatabaseSummaries(Collection<String> databaseNames) {
+        return uncheck(
+                () -> zookeeperClient.listDatabaseSummaries(databaseNames),
+                "Fail to get database summaries for " + databaseNames);
     }
 
     public List<String> listTables(String databaseName) throws DatabaseNotExistException {
@@ -325,20 +333,25 @@ public class MetadataManager {
             TablePath tablePath,
             List<TableChange> schemaChanges,
             boolean ignoreIfNotExists,
-            @Nullable LakeCatalog lakeCatalog,
-            LakeCatalog.Context lakeCatalogContext)
+            FlussPrincipal flussPrincipal)
             throws TableNotExistException, TableNotPartitionedException {
         try {
 
             TableInfo table = getTable(tablePath);
+            TableDescriptor tableDescriptor = table.toTableDescriptor();
 
             // validate the table column changes
             if (!schemaChanges.isEmpty()) {
-                Schema newSchema = SchemaUpdate.applySchemaChanges(table, schemaChanges);
-
+                Schema newSchema =
+                        SchemaUpdate.applySchemaChanges(table.getSchema(), schemaChanges);
+                LakeCatalog.Context lakeCatalogContext =
+                        new CoordinatorService.DefaultLakeCatalogContext(
+                                false,
+                                flussPrincipal,
+                                tableDescriptor,
+                                TableDescriptor.builder(tableDescriptor).schema(newSchema).build());
                 // Lake First: sync to Lake before updating Fluss schema
-                syncSchemaChangesToLake(
-                        tablePath, table, schemaChanges, lakeCatalog, lakeCatalogContext);
+                syncSchemaChangesToLake(tablePath, table, schemaChanges, lakeCatalogContext);
 
                 // Update Fluss schema (ZK) after Lake sync succeeds
                 if (!newSchema.equals(table.getSchema())) {
@@ -368,12 +381,13 @@ public class MetadataManager {
             TablePath tablePath,
             TableInfo tableInfo,
             List<TableChange> schemaChanges,
-            @Nullable LakeCatalog lakeCatalog,
             LakeCatalog.Context lakeCatalogContext) {
         if (!isDataLakeEnabled(tableInfo.toTableDescriptor())) {
             return;
         }
 
+        LakeCatalog lakeCatalog =
+                lakeCatalogDynamicLoader.getLakeCatalogContainer().getLakeCatalog();
         if (lakeCatalog == null) {
             throw new InvalidAlterTableException(
                     "Cannot alter schema for datalake enabled table "
@@ -397,9 +411,7 @@ public class MetadataManager {
             List<TableChange> tableChanges,
             TablePropertyChanges tablePropertyChanges,
             boolean ignoreIfNotExists,
-            @Nullable LakeCatalog lakeCatalog,
-            LakeTableTieringManager lakeTableTieringManager,
-            LakeCatalog.Context lakeCatalogContext) {
+            FlussPrincipal flussPrincipal) {
         try {
             // it throws TableNotExistException if the table or database not exists
             TableRegistration tableReg = getTableRegistration(tablePath);
@@ -425,26 +437,12 @@ public class MetadataManager {
                 // pre alter table properties, e.g. create lake table in lake storage if it's to
                 // enable datalake for the table
                 preAlterTableProperties(
-                        tablePath,
-                        tableDescriptor,
-                        newDescriptor,
-                        tableChanges,
-                        lakeCatalog,
-                        lakeCatalogContext);
+                        tablePath, tableDescriptor, newDescriptor, tableChanges, flussPrincipal);
                 // update the table to zk
                 TableRegistration updatedTableRegistration =
                         tableReg.newProperties(
                                 newDescriptor.getProperties(), newDescriptor.getCustomProperties());
                 zookeeperClient.updateTable(tablePath, updatedTableRegistration);
-
-                // post alter table properties, e.g. add the table to lake table tiering manager if
-                // it's to enable datalake for the table
-                postAlterTableProperties(
-                        tablePath,
-                        schemaInfo,
-                        tableDescriptor,
-                        updatedTableRegistration,
-                        lakeTableTieringManager);
             } else {
                 LOG.info(
                         "No properties changed when alter table {}, skip update table.", tablePath);
@@ -469,8 +467,13 @@ public class MetadataManager {
             TableDescriptor tableDescriptor,
             TableDescriptor newDescriptor,
             List<TableChange> tableChanges,
-            LakeCatalog lakeCatalog,
-            LakeCatalog.Context lakeCatalogContext) {
+            FlussPrincipal flussPrincipal) {
+        LakeCatalog.Context lakeCatalogContext =
+                new CoordinatorService.DefaultLakeCatalogContext(
+                        false, flussPrincipal, tableDescriptor, newDescriptor);
+        LakeCatalog lakeCatalog =
+                lakeCatalogDynamicLoader.getLakeCatalogContainer().getLakeCatalog();
+
         if (isDataLakeEnabled(newDescriptor)) {
             if (lakeCatalog == null) {
                 throw new InvalidAlterTableException(
@@ -507,30 +510,6 @@ public class MetadataManager {
                 }
             }
         }
-    }
-
-    private void postAlterTableProperties(
-            TablePath tablePath,
-            SchemaInfo schemaInfo,
-            TableDescriptor oldTableDescriptor,
-            TableRegistration newTableRegistration,
-            LakeTableTieringManager lakeTableTieringManager) {
-
-        boolean toEnableDataLake =
-                !isDataLakeEnabled(oldTableDescriptor)
-                        && isDataLakeEnabled(newTableRegistration.properties);
-        boolean toDisableDataLake =
-                isDataLakeEnabled(oldTableDescriptor)
-                        && !isDataLakeEnabled(newTableRegistration.properties);
-
-        if (toEnableDataLake) {
-            TableInfo newTableInfo = newTableRegistration.toTableInfo(tablePath, schemaInfo);
-            // if the table is lake table, we need to add it to lake table tiering manager
-            lakeTableTieringManager.addNewLakeTable(newTableInfo);
-        } else if (toDisableDataLake) {
-            lakeTableTieringManager.removeLakeTable(newTableRegistration.tableId);
-        }
-        // more post-alter actions can be added here
     }
 
     /**
@@ -574,11 +553,6 @@ public class MetadataManager {
         return Boolean.parseBoolean(dataLakeEnabledValue);
     }
 
-    private boolean isDataLakeEnabled(Map<String, String> properties) {
-        String dataLakeEnabledValue = properties.get(ConfigOptions.TABLE_DATALAKE_ENABLED.key());
-        return Boolean.parseBoolean(dataLakeEnabledValue);
-    }
-
     public void removeSensitiveTableOptions(Map<String, String> tableLakeOptions) {
         if (tableLakeOptions == null || tableLakeOptions.isEmpty()) {
             return;
@@ -606,8 +580,12 @@ public class MetadataManager {
         }
         TableRegistration tableReg = optionalTable.get();
         SchemaInfo schemaInfo = getLatestSchema(tablePath);
-        Map<String, String> tableLakeOptions =
+        Map<String, String> defaultTableLakeOptions =
                 lakeCatalogDynamicLoader.getLakeCatalogContainer().getDefaultTableLakeOptions();
+        // Create a copy to avoid ConcurrentModificationException when multiple threads
+        // call getTable() concurrently, as defaultTableLakeOptions is a shared instance
+        Map<String, String> tableLakeOptions =
+                defaultTableLakeOptions != null ? new HashMap<>(defaultTableLakeOptions) : null;
         removeSensitiveTableOptions(tableLakeOptions);
         return tableReg.toTableInfo(tablePath, schemaInfo, tableLakeOptions);
     }

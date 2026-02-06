@@ -383,8 +383,9 @@ abstract class FlinkAuthorizationITCase extends AbstractTestBase {
                 .rootCause()
                 .hasMessageContaining(
                         String.format(
-                                "No permission to READ table %s in database %s",
-                                tablePath.getTableName(), tablePath.getDatabaseName()));
+                                "Principal FlussPrincipal{name='guest', type='User'} have no authorization to "
+                                        + "operate READ on resource Resource{type=TABLE, name='%s'} ",
+                                tablePath));
         addAcl(Resource.database(tablePath.getDatabaseName()), READ);
         assertQueryResultExactOrder(
                 tBatchEnv,
@@ -455,8 +456,6 @@ abstract class FlinkAuthorizationITCase extends AbstractTestBase {
     private static Configuration initConfig() {
         Configuration conf = new Configuration();
         conf.setInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR, 3);
-        // set a shorter interval for testing purpose
-        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofSeconds(1));
         // set a shorter max lag time to make tests in FlussFailServerTableITCase faster
         conf.set(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME, Duration.ofSeconds(10));
         // set default datalake format for the cluster and enable datalake tables

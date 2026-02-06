@@ -20,17 +20,17 @@ package org.apache.fluss.flink.source.enumerator;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.initializer.BucketOffsetsRetrieverImpl;
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
+import org.apache.fluss.client.initializer.OffsetsInitializer;
+import org.apache.fluss.client.initializer.OffsetsInitializer.BucketOffsetsRetriever;
+import org.apache.fluss.client.initializer.SnapshotOffsetsInitializer;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.lake.LakeSplitGenerator;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
-import org.apache.fluss.flink.source.enumerator.initializer.BucketOffsetsRetrieverImpl;
-import org.apache.fluss.flink.source.enumerator.initializer.NoStoppingOffsetsInitializer;
-import org.apache.fluss.flink.source.enumerator.initializer.OffsetsInitializer;
-import org.apache.fluss.flink.source.enumerator.initializer.OffsetsInitializer.BucketOffsetsRetriever;
-import org.apache.fluss.flink.source.enumerator.initializer.SnapshotOffsetsInitializer;
 import org.apache.fluss.flink.source.event.PartitionBucketsUnsubscribedEvent;
 import org.apache.fluss.flink.source.event.PartitionsRemovedEvent;
 import org.apache.fluss.flink.source.split.HybridSnapshotLogSplit;
@@ -770,16 +770,6 @@ public class FlinkSourceEnumerator
                             TableBucket tableBucket = split.getTableBucket();
                             assignedTableBuckets.add(tableBucket);
 
-                            if (pendingHybridLakeFlussSplits != null) {
-                                // removed from the pendingHybridLakeFlussSplits
-                                // since this split already be assigned
-                                pendingHybridLakeFlussSplits.removeIf(
-                                        hybridLakeFlussSplit ->
-                                                hybridLakeFlussSplit
-                                                        .splitId()
-                                                        .equals(split.splitId()));
-                            }
-
                             if (isPartitioned) {
                                 long partitionId =
                                         checkNotNull(
@@ -792,6 +782,17 @@ public class FlinkSourceEnumerator
                                 assignedPartitions.put(partitionId, partitionName);
                             }
                         });
+
+                if (pendingHybridLakeFlussSplits != null) {
+                    Set<String> splitIdsToRemove =
+                            pendingAssignmentForReader.stream()
+                                    .map(SourceSplitBase::splitId)
+                                    .collect(Collectors.toSet());
+                    // removed from the pendingHybridLakeFlussSplits
+                    // since this split already be assigned
+                    pendingHybridLakeFlussSplits.removeIf(
+                            split -> splitIdsToRemove.contains(split.splitId()));
+                }
             }
         }
 

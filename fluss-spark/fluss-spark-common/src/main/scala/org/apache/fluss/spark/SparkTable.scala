@@ -17,24 +17,54 @@
 
 package org.apache.fluss.spark
 
+import org.apache.fluss.client.admin.Admin
 import org.apache.fluss.config.{Configuration => FlussConfiguration}
 import org.apache.fluss.metadata.{TableInfo, TablePath}
 import org.apache.fluss.spark.catalog.{AbstractSparkTable, SupportsFlussPartitionManagement}
+import org.apache.fluss.spark.read.{FlussAppendScanBuilder, FlussUpsertScanBuilder}
 import org.apache.fluss.spark.write.{FlussAppendWriteBuilder, FlussUpsertWriteBuilder}
 
-import org.apache.spark.sql.connector.catalog.SupportsWrite
+import org.apache.spark.sql.catalyst.SQLConfHelper
+import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite}
+import org.apache.spark.sql.connector.read.ScanBuilder
 import org.apache.spark.sql.connector.write.{LogicalWriteInfo, WriteBuilder}
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
-case class SparkTable(tablePath: TablePath, tableInfo: TableInfo, flussConfig: FlussConfiguration)
-  extends AbstractSparkTable(tableInfo)
+class SparkTable(
+    tablePath: TablePath,
+    tableInfo: TableInfo,
+    flussConfig: FlussConfiguration,
+    admin: Admin)
+  extends AbstractSparkTable(admin, tableInfo)
   with SupportsFlussPartitionManagement
-  with SupportsWrite {
+  with SupportsRead
+  with SupportsWrite
+  with SQLConfHelper {
+
+  private def populateSparkConf(flussConfig: FlussConfiguration): Unit = {
+    conf.getAllConfs
+      .filter(_._1.startsWith(SparkFlussConf.SPARK_FLUSS_CONF_PREFIX))
+      .foreach {
+        case (k, v) =>
+          flussConfig.setString(k.substring(SparkFlussConf.SPARK_FLUSS_CONF_PREFIX.length), v)
+      }
+  }
 
   override def newWriteBuilder(logicalWriteInfo: LogicalWriteInfo): WriteBuilder = {
+    populateSparkConf(flussConfig)
     if (tableInfo.getPrimaryKeys.isEmpty) {
       new FlussAppendWriteBuilder(tablePath, logicalWriteInfo.schema(), flussConfig)
     } else {
       new FlussUpsertWriteBuilder(tablePath, logicalWriteInfo.schema(), flussConfig)
+    }
+  }
+
+  override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+    populateSparkConf(flussConfig)
+    if (tableInfo.getPrimaryKeys.isEmpty) {
+      new FlussAppendScanBuilder(tablePath, tableInfo, options, flussConfig)
+    } else {
+      new FlussUpsertScanBuilder(tablePath, tableInfo, options, flussConfig)
     }
   }
 }

@@ -27,7 +27,9 @@ import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.client.table.writer.AppendWriter;
+import org.apache.fluss.client.table.writer.DeleteResult;
 import org.apache.fluss.client.table.writer.TableWriter;
+import org.apache.fluss.client.table.writer.UpsertResult;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -48,6 +50,7 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.ProjectedRow;
 import org.apache.fluss.row.indexed.IndexedRow;
 import org.apache.fluss.types.BigIntType;
 import org.apache.fluss.types.DataTypes;
@@ -66,8 +69,10 @@ import javax.annotation.Nullable;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 import static org.apache.fluss.client.table.scanner.batch.BatchScanUtils.collectRows;
@@ -102,6 +107,9 @@ class FlussTableITCase extends ClientToServerITCaseBase {
                 DATA1_TABLE_DESCRIPTOR_PK
                         .withReplicationFactor(3)
                         .withDataLakeFormat(DataLakeFormat.PAIMON);
+        Map<String, String> options = new HashMap<>(expected.getProperties());
+        options.put(ConfigOptions.TABLE_KV_FORMAT_VERSION.key(), "2");
+        expected = expected.withProperties(options);
         assertThat(tableInfo.toTableDescriptor()).isEqualTo(expected);
     }
 
@@ -304,10 +312,17 @@ class FlussTableITCase extends ClientToServerITCaseBase {
         createTable(tablePath, descriptor, false);
         Table table = conn.getTable(tablePath);
         TableInfo tableInfo = table.getTableInfo();
-        verifyPutAndLookup(table, new Object[] {1, "a", 1L, "value1"});
-        verifyPutAndLookup(table, new Object[] {1, "a", 2L, "value2"});
-        verifyPutAndLookup(table, new Object[] {1, "a", 3L, "value3"});
-        verifyPutAndLookup(table, new Object[] {2, "a", 4L, "value4"});
+
+        // We use strings with length > 7 (e.g., "aaaaaaaaa") for column 'b' to properly test
+        // prefix lookup. Previously, short strings hid a bug: Paimon's encoder stores strings
+        // longer than 7 characters in a variable-length area, which breaks prefix lookup since
+        // the encoded bucket key bytes are no longer a prefix of the encoded primary key bytes.
+        // Since 'b' is part of the bucket key (a, b), using longer strings for 'b' ensures we
+        // catch such issues.
+        verifyPutAndLookup(table, new Object[] {1, "aaaaaaaaa", 1L, "value1"});
+        verifyPutAndLookup(table, new Object[] {1, "aaaaaaaaa", 2L, "value2"});
+        verifyPutAndLookup(table, new Object[] {1, "aaaaaaaaa", 3L, "value3"});
+        verifyPutAndLookup(table, new Object[] {2, "aaaaaaaaa", 4L, "value4"});
         RowType rowType = schema.getRowType();
 
         // test prefix lookup.
@@ -319,22 +334,24 @@ class FlussTableITCase extends ClientToServerITCaseBase {
         RowType prefixKeyRowType = prefixKeySchema.getRowType();
         Lookuper prefixLookuper =
                 table.newLookup().lookupBy(prefixKeyRowType.getFieldNames()).createLookuper();
-        CompletableFuture<LookupResult> result = prefixLookuper.lookup(row(1, "a"));
+        CompletableFuture<LookupResult> result = prefixLookuper.lookup(row(1, "aaaaaaaaa"));
         LookupResult prefixLookupResult = result.get();
         assertThat(prefixLookupResult).isNotNull();
         List<InternalRow> rowList = prefixLookupResult.getRowList();
         assertThat(rowList.size()).isEqualTo(3);
         for (int i = 0; i < rowList.size(); i++) {
             assertRowValueEquals(
-                    rowType, rowList.get(i), new Object[] {1, "a", i + 1L, "value" + (i + 1)});
+                    rowType,
+                    rowList.get(i),
+                    new Object[] {1, "aaaaaaaaa", i + 1L, "value" + (i + 1)});
         }
 
-        result = prefixLookuper.lookup(row(2, "a"));
+        result = prefixLookuper.lookup(row(2, "aaaaaaaaa"));
         prefixLookupResult = result.get();
         assertThat(prefixLookupResult).isNotNull();
         rowList = prefixLookupResult.getRowList();
         assertThat(rowList.size()).isEqualTo(1);
-        assertRowValueEquals(rowType, rowList.get(0), new Object[] {2, "a", 4L, "value4"});
+        assertRowValueEquals(rowType, rowList.get(0), new Object[] {2, "aaaaaaaaa", 4L, "value4"});
 
         result = prefixLookuper.lookup(compactedRow(prefixKeyRowType, new Object[] {3, "a"}));
         prefixLookupResult = result.get();
@@ -366,16 +383,19 @@ class FlussTableITCase extends ClientToServerITCaseBase {
                 Table newSchemaTable = connection.getTable(tableInfo.getTablePath())) {
             // schema change case1: read new data with new schema.
             verifyPutAndLookup(
-                    newSchemaTable, new Object[] {1, "a", 4L, "value4", "add_column_value"});
+                    newSchemaTable,
+                    new Object[] {1, "aaaaaaaaa", 4L, "value4", "add_column_value"});
             // schema change case2: read new data with old schema.
-            result = prefixLookuper.lookup(row(1, "a"));
+            result = prefixLookuper.lookup(row(1, "aaaaaaaaa"));
             prefixLookupResult = result.get();
             assertThat(prefixLookupResult).isNotNull();
             rowList = prefixLookupResult.getRowList();
             assertThat(rowList.size()).isEqualTo(4);
             for (int i = 0; i < rowList.size(); i++) {
                 assertRowValueEquals(
-                        rowType, rowList.get(i), new Object[] {1, "a", i + 1L, "value" + (i + 1)});
+                        rowType,
+                        rowList.get(i),
+                        new Object[] {1, "aaaaaaaaa", i + 1L, "value" + (i + 1)});
             }
             admin.getTableSchema(tablePath, 1).get();
             // schema change case3: read old data with new schema.
@@ -384,7 +404,7 @@ class FlussTableITCase extends ClientToServerITCaseBase {
                             .newLookup()
                             .lookupBy(prefixKeyRowType.getFieldNames())
                             .createLookuper();
-            result = newPrefixLookuper.lookup(row(1, "a"));
+            result = newPrefixLookuper.lookup(row(1, "aaaaaaaaa"));
             prefixLookupResult = result.get();
             assertThat(prefixLookupResult).isNotNull();
             rowList = prefixLookupResult.getRowList();
@@ -394,7 +414,11 @@ class FlussTableITCase extends ClientToServerITCaseBase {
                         rowType,
                         rowList.get(i),
                         new Object[] {
-                            1, "a", i + 1L, "value" + (i + 1), i == 3 ? "add_column_value" : null
+                            1,
+                            "aaaaaaaaa",
+                            i + 1L,
+                            "value" + (i + 1),
+                            i == 3 ? "add_column_value" : null
                         });
             }
         }
@@ -452,6 +476,181 @@ class FlussTableITCase extends ClientToServerITCaseBase {
                 .hasMessageContaining(
                         "Can not perform prefix lookup on table 'test_db_1.test_invalid_prefix_lookup_2', "
                                 + "because the lookup columns [b, a] must contain all bucket keys [a, b] in order.");
+    }
+
+    @Test
+    void testSingleBucketPutAutoIncrementColumnAndLookup() throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("col1", DataTypes.STRING())
+                        .withComment("col1 is first column")
+                        .column("col2", DataTypes.BIGINT())
+                        .withComment("col2 is second column, auto increment column")
+                        .column("col3", DataTypes.STRING())
+                        .withComment("col3 is third column")
+                        .enableAutoIncrement("col2")
+                        .primaryKey("col1")
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(1, "col1").build();
+        // create the table
+        TablePath tablePath =
+                TablePath.of(DATA1_TABLE_PATH_PK.getDatabaseName(), "test_pk_table_auto_inc");
+        createTable(tablePath, tableDescriptor, true);
+        Table autoIncTable = conn.getTable(tablePath);
+        Object[][] records = {
+            {"a", null, "batch1"},
+            {"b", null, "batch1"},
+            {"c", null, "batch1"},
+            {"d", null, "batch1"},
+            {"e", null, "batch1"},
+            {"d", null, "batch2"},
+            {"e", null, "batch2"}
+        };
+        partialUpdateRecords(new String[] {"col1", "col3"}, records, autoIncTable);
+
+        Object[][] expectedRecords = {
+            {"a", 1L, "batch1"},
+            {"b", 2L, "batch1"},
+            {"c", 3L, "batch1"},
+            {"d", 4L, "batch2"},
+            {"e", 5L, "batch2"}
+        };
+        verifyRecords(expectedRecords, autoIncTable, schema);
+
+        admin.alterTable(
+                        tablePath,
+                        Collections.singletonList(
+                                TableChange.addColumn(
+                                        "col4",
+                                        DataTypes.INT(),
+                                        null,
+                                        TableChange.ColumnPosition.last())),
+                        false)
+                .get();
+        Table newSchemaTable = conn.getTable(tablePath);
+        Schema newSchema = newSchemaTable.getTableInfo().getSchema();
+
+        // schema change case1: read new data with new schema.
+        Object[][] expectedRecordsWithOldSchema = {
+            {"a", 1L, "batch1"},
+            {"b", 2L, "batch1"},
+            {"c", 3L, "batch1"},
+            {"d", 4L, "batch2"},
+            {"e", 5L, "batch2"}
+        };
+        verifyRecords(expectedRecordsWithOldSchema, autoIncTable, schema);
+
+        // schema change case2: update new data with new schema.
+
+        Object[][] recordsWithNewSchema = {
+            {"a", null, "batch3", 10},
+            {"b", null, "batch3", 11}
+        };
+        partialUpdateRecords(
+                new String[] {"col1", "col3", "col4"}, recordsWithNewSchema, newSchemaTable);
+
+        // schema change case3: read data with old schema.
+        expectedRecordsWithOldSchema[0][2] = "batch3";
+        expectedRecordsWithOldSchema[1][2] = "batch3";
+        verifyRecords(expectedRecordsWithOldSchema, autoIncTable, schema);
+
+        // schema change case4: read data with new schema.
+        Object[][] expectedRecordsWithNewSchema = {
+            {"a", 1L, "batch3", 10},
+            {"b", 2L, "batch3", 11},
+            {"c", 3L, "batch1", null},
+            {"d", 4L, "batch2", null},
+            {"e", 5L, "batch2", null}
+        };
+        verifyRecords(expectedRecordsWithNewSchema, newSchemaTable, newSchema);
+
+        // kill and restart all tablet server
+        for (int i = 0; i < 3; i++) {
+            FLUSS_CLUSTER_EXTENSION.stopTabletServer(i);
+            FLUSS_CLUSTER_EXTENSION.startTabletServer(i);
+        }
+
+        // reconnect fluss server
+        conn = ConnectionFactory.createConnection(clientConf);
+        newSchemaTable = conn.getTable(tablePath);
+        verifyRecords(expectedRecordsWithNewSchema, newSchemaTable, newSchema);
+
+        Object[][] restartWriteRecords = {{"f", null, "batch4", 12}};
+        partialUpdateRecords(
+                new String[] {"col1", "col3", "col4"}, restartWriteRecords, newSchemaTable);
+
+        // The auto-increment column should start from a new segment for now, and local cached
+        // IDs have been discarded.
+        Object[][] expectedRestartWriteRecords = {{"f", 100001L, "batch4", 12}};
+        verifyRecords(expectedRestartWriteRecords, newSchemaTable, newSchema);
+    }
+
+    @Test
+    void testPutAutoIncrementColumnAndLookup() throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("dt", DataTypes.STRING())
+                        .column("col1", DataTypes.STRING())
+                        .withComment("col1 is first column")
+                        .column("col2", DataTypes.BIGINT())
+                        .withComment("col2 is second column, auto increment column")
+                        .column("col3", DataTypes.STRING())
+                        .withComment("col3 is third column")
+                        .enableAutoIncrement("col2")
+                        .primaryKey("dt", "col1")
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .partitionedBy("dt")
+                        .distributedBy(2, "col1")
+                        .build();
+        // create the table
+        TablePath tablePath =
+                TablePath.of(DATA1_TABLE_PATH_PK.getDatabaseName(), "test_pk_table_auto_inc");
+        createTable(tablePath, tableDescriptor, true);
+        Table autoIncTable = conn.getTable(tablePath);
+        Object[][] records = {
+            {"2026-01-06", "a", null, "batch1"},
+            {"2026-01-06", "b", null, "batch1"},
+            {"2026-01-06", "c", null, "batch1"},
+            {"2026-01-06", "d", null, "batch1"},
+            {"2026-01-07", "e", null, "batch1"},
+            {"2026-01-06", "a", null, "batch2"},
+            {"2026-01-06", "b", null, "batch2"},
+        };
+
+        // upsert records with auto inc column col1 null value
+        partialUpdateRecords(new String[] {"dt", "col1", "col3"}, records, autoIncTable);
+        Object[][] expectedRecords = {
+            {"2026-01-06", "a", 1L, "batch2"},
+            {"2026-01-06", "b", 100001L, "batch2"},
+            {"2026-01-06", "c", 2L, "batch1"},
+            {"2026-01-06", "d", 100002L, "batch1"},
+            {"2026-01-07", "e", 200001L, "batch1"}
+        };
+        verifyRecords(expectedRecords, autoIncTable, schema);
+    }
+
+    private void partialUpdateRecords(String[] targetColumns, Object[][] records, Table table) {
+        UpsertWriter upsertWriter = table.newUpsert().partialUpdate(targetColumns).createWriter();
+        for (Object[] record : records) {
+            upsertWriter.upsert(row(record));
+            // flush immediately to ensure auto-increment values are assigned sequentially across
+            // multiple buckets.
+            upsertWriter.flush();
+        }
+    }
+
+    private void verifyRecords(Object[][] records, Table table, Schema schema) throws Exception {
+        Lookuper lookuper = table.newLookup().createLookuper();
+        ProjectedRow keyRow = ProjectedRow.from(schema.getPrimaryKeyIndexes());
+        for (Object[] record : records) {
+            assertThatRow(lookupRow(lookuper, keyRow.replaceRow(row(record))))
+                    .withSchema(schema.getRowType())
+                    .isEqualTo(row(record));
+        }
     }
 
     @Test
@@ -1572,7 +1771,8 @@ class FlussTableITCase extends ClientToServerITCaseBase {
                         .logFormat(LogFormat.COMPACTED)
                         .build();
         TablePath path = TablePath.of("test_db_1", "test_pk_compacted_latest");
-        createTable(path, td, false);
+        long tableId = createTable(path, td, false);
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableId);
 
         try (Table table = conn.getTable(path)) {
             LogScanner scanner = createLogScanner(table);
@@ -1605,6 +1805,105 @@ class FlussTableITCase extends ClientToServerITCaseBase {
             assertThat(total).isEqualTo(0);
 
             scanner.close();
+        }
+    }
+
+    // ---------------------- Upsert/Delete Result with LogEndOffset tests ----------------------
+
+    @Test
+    void testUpsertAndDeleteReturnLogEndOffset() throws Exception {
+        // Create a PK table with single bucket for predictable offset tracking
+        TablePath tablePath = TablePath.of("test_db_1", "test_upsert_delete_log_end_offset");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.STRING())
+                        .primaryKey("a")
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(1, "a").build();
+        createTable(tablePath, tableDescriptor, true);
+
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            TableBucket expectedBucket = new TableBucket(table.getTableInfo().getTableId(), 0);
+
+            // First upsert - should return log end offset > 0
+            UpsertResult upsertResult1 = upsertWriter.upsert(row(1, "a")).get();
+            assertThat(upsertResult1.getBucket()).isEqualTo(expectedBucket);
+            assertThat(upsertResult1.getLogEndOffset()).isEqualTo(1);
+
+            // Second upsert - should return higher log end offset
+            UpsertResult upsertResult2 = upsertWriter.upsert(row(2, "b")).get();
+            assertThat(upsertResult2.getBucket()).isEqualTo(expectedBucket);
+            assertThat(upsertResult2.getLogEndOffset()).isEqualTo(2);
+
+            // Update existing key - should return higher log end offset
+            UpsertResult upsertResult3 = upsertWriter.upsert(row(1, "aa")).get();
+            assertThat(upsertResult3.getBucket()).isEqualTo(expectedBucket);
+            assertThat(upsertResult3.getLogEndOffset()).isEqualTo(4);
+
+            // Delete - should return higher log end offset
+            DeleteResult deleteResult = upsertWriter.delete(row(1, "aa")).get();
+            assertThat(deleteResult.getBucket()).isEqualTo(expectedBucket);
+            assertThat(deleteResult.getLogEndOffset()).isEqualTo(5);
+
+            // Verify the data via lookup
+            Lookuper lookuper = table.newLookup().createLookuper();
+            // key 1 should be deleted
+            assertThat(lookupRow(lookuper, row(1))).isNull();
+            // key 2 should exist
+            assertThat(lookupRow(lookuper, row(2))).isNotNull();
+        }
+    }
+
+    @Test
+    void testBatchedUpsertReturnsSameLogEndOffset() throws Exception {
+        // Test that multiple records in the same batch receive the same log end offset
+        TablePath tablePath = TablePath.of("test_db_1", "test_batched_upsert_log_end_offset");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.STRING())
+                        .primaryKey("a")
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(schema).distributedBy(1, "a").build();
+        long tableId = createTable(tablePath, tableDescriptor, true);
+
+        // Configure small batch size to ensure records are batched together
+        Configuration config = new Configuration(clientConf);
+        config.set(ConfigOptions.CLIENT_WRITER_BATCH_SIZE, new MemorySize(1024 * 1024)); // 1MB
+        config.set(
+                ConfigOptions.CLIENT_WRITER_MAX_INFLIGHT_REQUESTS_PER_BUCKET, 1); // Force batching
+
+        try (Connection connection = ConnectionFactory.createConnection(config);
+                Table table = connection.getTable(tablePath)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+
+            // Send multiple upserts without waiting - they should be batched
+            CompletableFuture<UpsertResult> future1 = upsertWriter.upsert(row(1, "a"));
+            CompletableFuture<UpsertResult> future2 = upsertWriter.upsert(row(2, "b"));
+            CompletableFuture<UpsertResult> future3 = upsertWriter.upsert(row(3, "c"));
+
+            // Flush to send the batch
+            upsertWriter.flush();
+
+            // Get results
+            UpsertResult result1 = future1.get();
+            UpsertResult result2 = future2.get();
+            UpsertResult result3 = future3.get();
+
+            TableBucket expectedBucket = new TableBucket(tableId, 0);
+            // All results should have valid bucket and log end offset
+            assertThat(result1.getBucket()).isEqualTo(expectedBucket);
+            assertThat(result2.getBucket()).isEqualTo(expectedBucket);
+            assertThat(result3.getBucket()).isEqualTo(expectedBucket);
+            // Records in the same batch should have the same log end offset
+            // (since they're sent to the same bucket)
+            assertThat(result1.getLogEndOffset()).isEqualTo(3);
+            assertThat(result2.getLogEndOffset()).isEqualTo(3);
+            assertThat(result3.getLogEndOffset()).isEqualTo(3);
         }
     }
 }

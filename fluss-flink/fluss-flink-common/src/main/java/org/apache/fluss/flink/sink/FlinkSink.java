@@ -21,18 +21,29 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.adapter.SinkAdapter;
 import org.apache.fluss.flink.sink.serializer.FlussSerializationSchema;
+import org.apache.fluss.flink.sink.shuffle.DataStatisticsOperatorFactory;
+import org.apache.fluss.flink.sink.shuffle.DistributionMode;
+import org.apache.fluss.flink.sink.shuffle.StatisticsOrRecord;
+import org.apache.fluss.flink.sink.shuffle.StatisticsOrRecordChannelComputer;
+import org.apache.fluss.flink.sink.shuffle.StatisticsOrRecordTypeInformation;
 import org.apache.fluss.flink.sink.writer.AppendSinkWriter;
 import org.apache.fluss.flink.sink.writer.FlinkSinkWriter;
 import org.apache.fluss.flink.sink.writer.UpsertSinkWriter;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.TablePath;
 
+import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.operators.MailboxExecutor;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.runtime.metrics.groups.InternalSinkWriterMetricGroup;
 import org.apache.flink.streaming.api.connector.sink2.SupportsPreWriteTopology;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSink;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
+import org.apache.flink.table.connector.sink.SinkV2Provider;
 import org.apache.flink.table.types.logical.RowType;
 
 import javax.annotation.Nullable;
@@ -44,14 +55,16 @@ import static org.apache.fluss.flink.sink.FlinkStreamPartitioner.partition;
 import static org.apache.fluss.flink.utils.FlinkConversions.toFlussRowType;
 
 /** Flink sink for Fluss. */
-class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteTopology<InputT> {
+class FlinkSink<InputT> extends SinkAdapter<InputT> {
 
     private static final long serialVersionUID = 1L;
 
-    private final SinkWriterBuilder<? extends FlinkSinkWriter, InputT> builder;
+    protected final SinkWriterBuilder<? extends FlinkSinkWriter, InputT> builder;
+    private final TablePath tablePath;
 
-    FlinkSink(SinkWriterBuilder<? extends FlinkSinkWriter, InputT> builder) {
+    FlinkSink(SinkWriterBuilder<? extends FlinkSinkWriter, InputT> builder, TablePath tablePath) {
         this.builder = builder;
+        this.tablePath = tablePath;
     }
 
     @Override
@@ -62,9 +75,22 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
         return flinkSinkWriter;
     }
 
-    @Override
-    public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
-        return builder.addPreWriteTopology(input);
+    /**
+     * {@link FlinkSink} serves as the SQL connector. Since we uses {@link DataStreamSinkProvider}
+     * (rather than {@link SinkV2Provider}), it does not automatically recognize or invoke the
+     * {@link SupportsPreWriteTopology} interface. Therefore, the pre-write topology must be added
+     * manually here.
+     *
+     * <p>In contrast, {@link FlussSink} is used directly as a DataStream connector, Flink’s runtime
+     * explicitly checks for the {@link SupportsPreWriteTopology} interface and automatically
+     * incorporates the pre-write topology if present. To support this path, the {@link
+     * SupportsPreWriteTopology} implementation resides in {@link FlussSink}.
+     */
+    public DataStreamSink<InputT> apply(DataStream<InputT> input) {
+        return builder.addPreWriteTopology(input)
+                .sinkTo(this)
+                .name("Sink(" + tablePath + ")")
+                .setParallelism(input.getParallelism());
     }
 
     @Internal
@@ -87,7 +113,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
         private final List<String> bucketKeys;
         private final List<String> partitionKeys;
         private final @Nullable DataLakeFormat lakeFormat;
-        private final boolean shuffleByBucketId;
+        private final DistributionMode distributionMode;
         private final FlussSerializationSchema<InputT> flussSerializationSchema;
 
         public AppendSinkWriterBuilder(
@@ -98,7 +124,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
                 List<String> bucketKeys,
                 List<String> partitionKeys,
                 @Nullable DataLakeFormat lakeFormat,
-                boolean shuffleByBucketId,
+                DistributionMode distributionMode,
                 FlussSerializationSchema<InputT> flussSerializationSchema) {
             this.tablePath = tablePath;
             this.flussConfig = flussConfig;
@@ -107,7 +133,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
             this.bucketKeys = bucketKeys;
             this.partitionKeys = partitionKeys;
             this.lakeFormat = lakeFormat;
-            this.shuffleByBucketId = shuffleByBucketId;
+            this.distributionMode = distributionMode;
             this.flussSerializationSchema = flussSerializationSchema;
         }
 
@@ -123,21 +149,78 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
 
         @Override
         public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
-            // For append only sink, we will do bucket shuffle only if bucket keys are not empty.
-            if (!bucketKeys.isEmpty() && shuffleByBucketId) {
-                return partition(
-                        input,
-                        new FlinkRowDataChannelComputer<>(
-                                toFlussRowType(tableRowType),
-                                bucketKeys,
-                                partitionKeys,
-                                lakeFormat,
-                                numBucket,
-                                flussSerializationSchema),
-                        input.getParallelism());
-            } else {
-                return input;
+            switch (distributionMode) {
+                case NONE:
+                    return input;
+                case AUTO:
+                    // if bucket keys are not empty, use BUCKET as default. Otherwise, use NONE.
+                    return bucketKeys.isEmpty() ? input : bucketShuffle(input);
+                case BUCKET:
+                    if (!bucketKeys.isEmpty()) {
+                        return bucketShuffle(input);
+                    }
+                    throw new UnsupportedOperationException(
+                            "BUCKET mode is only supported for log tables with bucket keys");
+                case PARTITION_DYNAMIC:
+                    if (partitionKeys.isEmpty()) {
+                        throw new UnsupportedOperationException(
+                                "PARTITION_DYNAMIC is only supported for partitioned tables");
+                    }
+
+                    TypeInformation<StatisticsOrRecord<InputT>> statisticsOrRecordTypeInformation =
+                            new StatisticsOrRecordTypeInformation<>(input.getType());
+                    SingleOutputStreamOperator<StatisticsOrRecord<InputT>> shuffleStream =
+                            input.transform(
+                                            "Collect Statistics",
+                                            statisticsOrRecordTypeInformation,
+                                            new DataStatisticsOperatorFactory<>(
+                                                    toFlussRowType(tableRowType),
+                                                    partitionKeys,
+                                                    flussSerializationSchema))
+                                    // Set the parallelism same as input operator to encourage
+                                    // chaining
+                                    .setParallelism(input.getParallelism());
+
+                    return partition(
+                                    shuffleStream,
+                                    new StatisticsOrRecordChannelComputer<>(
+                                            toFlussRowType(tableRowType),
+                                            bucketKeys,
+                                            partitionKeys,
+                                            numBucket,
+                                            lakeFormat,
+                                            flussSerializationSchema),
+                                    input.getParallelism())
+                            .flatMap(
+                                    (FlatMapFunction<StatisticsOrRecord<InputT>, InputT>)
+                                            (statisticsOrRecord, out) -> {
+                                                if (statisticsOrRecord.isRecord()) {
+                                                    out.collect(statisticsOrRecord.record());
+                                                }
+                                            })
+                            .name("Strip Statistics")
+                            .setParallelism(input.getParallelism())
+                            // we remove the slot sharing group here make all operators can be
+                            // co-located in the same TaskManager slot
+                            .returns(input.getType());
+
+                default:
+                    throw new UnsupportedOperationException(
+                            "Unsupported distribution mode: " + distributionMode);
             }
+        }
+
+        private DataStream<InputT> bucketShuffle(DataStream<InputT> input) {
+            return partition(
+                    input,
+                    new FlinkRowDataChannelComputer<>(
+                            toFlussRowType(tableRowType),
+                            bucketKeys,
+                            partitionKeys,
+                            lakeFormat,
+                            numBucket,
+                            flussSerializationSchema),
+                    input.getParallelism());
         }
     }
 
@@ -155,7 +238,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
         private final List<String> bucketKeys;
         private final List<String> partitionKeys;
         private final @Nullable DataLakeFormat lakeFormat;
-        private final boolean shuffleByBucketId;
+        private final DistributionMode distributionMode;
         private final FlussSerializationSchema<InputT> flussSerializationSchema;
 
         UpsertSinkWriterBuilder(
@@ -167,7 +250,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
                 List<String> bucketKeys,
                 List<String> partitionKeys,
                 @Nullable DataLakeFormat lakeFormat,
-                boolean shuffleByBucketId,
+                DistributionMode distributionMode,
                 FlussSerializationSchema<InputT> flussSerializationSchema) {
             this.tablePath = tablePath;
             this.flussConfig = flussConfig;
@@ -177,7 +260,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
             this.bucketKeys = bucketKeys;
             this.partitionKeys = partitionKeys;
             this.lakeFormat = lakeFormat;
-            this.shuffleByBucketId = shuffleByBucketId;
+            this.distributionMode = distributionMode;
             this.flussSerializationSchema = flussSerializationSchema;
         }
 
@@ -194,8 +277,12 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
 
         @Override
         public DataStream<InputT> addPreWriteTopology(DataStream<InputT> input) {
-            return shuffleByBucketId
-                    ? partition(
+            switch (distributionMode) {
+                case NONE:
+                    return input;
+                case AUTO:
+                case BUCKET:
+                    return partition(
                             input,
                             new FlinkRowDataChannelComputer<>(
                                     toFlussRowType(tableRowType),
@@ -204,8 +291,13 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> implements SupportsPreWriteT
                                     lakeFormat,
                                     numBucket,
                                     flussSerializationSchema),
-                            input.getParallelism())
-                    : input;
+                            input.getParallelism());
+                default:
+                    throw new UnsupportedOperationException(
+                            String.format(
+                                    "Unsupported distribution mode: %s for primary key table",
+                                    distributionMode));
+            }
         }
     }
 }

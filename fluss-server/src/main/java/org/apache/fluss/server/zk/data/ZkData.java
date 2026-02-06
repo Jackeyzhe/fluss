@@ -26,6 +26,8 @@ import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.security.acl.ResourceType;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableJsonSerde;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
+import org.apache.fluss.server.zk.data.producer.ProducerOffsetsJsonSerde;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -249,6 +251,28 @@ public final class ZkData {
     public static final class TableSequenceIdZNode {
         public static String path() {
             return "/metadata/table_seqid";
+        }
+    }
+
+    /**
+     * The znode for auto increment columns of a table. The znode path is:
+     *
+     * <p>/metadata/databases/[databaseName]/tables/[tableName]/auto_inc
+     */
+    public static final class AutoIncrementColumnsZNode {
+        public static String path(TablePath tablePath) {
+            return TableZNode.path(tablePath) + "/auto_inc";
+        }
+    }
+
+    /**
+     * The znode for auto increment column. The znode path is:
+     *
+     * <p>/metadata/databases/[databaseName]/tables/[tableName]/auto_inc/col_[columnId]
+     */
+    public static final class AutoIncrementColumnZNode {
+        public static String path(TablePath tablePath, int columnId) {
+            return AutoIncrementColumnsZNode.path(tablePath) + String.format("/col_%d", columnId);
         }
     }
 
@@ -810,12 +834,76 @@ public final class ZkData {
             return "/cluster/rebalance";
         }
 
-        public static byte[] encode(RebalancePlan rebalancePlan) {
-            return JsonSerdeUtils.writeValueAsBytes(rebalancePlan, RebalancePlanJsonSerde.INSTANCE);
+        public static byte[] encode(RebalanceTask rebalanceTask) {
+            return JsonSerdeUtils.writeValueAsBytes(rebalanceTask, RebalanceTaskJsonSerde.INSTANCE);
         }
 
-        public static RebalancePlan decode(byte[] json) {
-            return JsonSerdeUtils.readValue(json, RebalancePlanJsonSerde.INSTANCE);
+        public static RebalanceTask decode(byte[] json) {
+            return JsonSerdeUtils.readValue(json, RebalanceTaskJsonSerde.INSTANCE);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // ZNodes under "/producers/"
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * The znode for producers. This is the root node for all producer offset snapshots. The znode
+     * path is:
+     *
+     * <p>/producers
+     */
+    public static final class ProducersZNode {
+        public static String path() {
+            return "/producers";
+        }
+    }
+
+    /**
+     * The znode for a specific producer's offset snapshot. The znode path is:
+     *
+     * <p>/producers/[producerId]
+     *
+     * <p>This znode stores {@link ProducerOffsets} which contains:
+     *
+     * <ul>
+     *   <li>expiration_time: TTL for automatic cleanup
+     *   <li>tables: List of table offset metadata with paths to remote offset files
+     * </ul>
+     *
+     * <p>The actual offset data is stored in remote storage (e.g., OSS/S3) and referenced by the
+     * file paths in the metadata.
+     */
+    public static final class ProducerIdZNode {
+        /**
+         * Returns the ZK path for the producer snapshot znode.
+         *
+         * @param producerId the producer ID (typically Flink job ID)
+         * @return the ZK path
+         */
+        public static String path(String producerId) {
+            return ProducersZNode.path() + "/" + producerId;
+        }
+
+        /**
+         * Encodes a ProducerOffsets to JSON bytes for storage in ZK.
+         *
+         * @param producerOffsets the ProducerOffsets to encode
+         * @return the encoded bytes
+         */
+        public static byte[] encode(ProducerOffsets producerOffsets) {
+            return JsonSerdeUtils.writeValueAsBytes(
+                    producerOffsets, ProducerOffsetsJsonSerde.INSTANCE);
+        }
+
+        /**
+         * Decodes JSON bytes from ZK to a ProducerOffsets.
+         *
+         * @param json the JSON bytes from ZK
+         * @return the decoded ProducerOffsets
+         */
+        public static ProducerOffsets decode(byte[] json) {
+            return JsonSerdeUtils.readValue(json, ProducerOffsetsJsonSerde.INSTANCE);
         }
     }
 }

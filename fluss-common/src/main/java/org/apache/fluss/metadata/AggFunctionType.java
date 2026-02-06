@@ -18,9 +18,8 @@
 package org.apache.fluss.metadata;
 
 import org.apache.fluss.annotation.PublicEvolving;
-import org.apache.fluss.types.BooleanType;
 import org.apache.fluss.types.DataType;
-import org.apache.fluss.types.DataTypeFamily;
+import org.apache.fluss.types.DataTypeRoot;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -38,45 +37,93 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 @PublicEvolving
 public enum AggFunctionType {
     // Numeric aggregation
-    SUM(Collections.emptySet(), new DataTypeFamily[] {DataTypeFamily.NUMERIC}),
-    PRODUCT(Collections.emptySet(), new DataTypeFamily[] {DataTypeFamily.NUMERIC}),
+    SUM(
+            Collections.emptySet(),
+            new DataTypeRoot[] {
+                DataTypeRoot.TINYINT,
+                DataTypeRoot.SMALLINT,
+                DataTypeRoot.INTEGER,
+                DataTypeRoot.BIGINT,
+                DataTypeRoot.FLOAT,
+                DataTypeRoot.DOUBLE,
+                DataTypeRoot.DECIMAL
+            }),
+    PRODUCT(
+            Collections.emptySet(),
+            new DataTypeRoot[] {
+                DataTypeRoot.TINYINT,
+                DataTypeRoot.SMALLINT,
+                DataTypeRoot.INTEGER,
+                DataTypeRoot.BIGINT,
+                DataTypeRoot.FLOAT,
+                DataTypeRoot.DOUBLE,
+                DataTypeRoot.DECIMAL
+            }),
     MAX(
             Collections.emptySet(),
-            new DataTypeFamily[] {
-                DataTypeFamily.CHARACTER_STRING, DataTypeFamily.NUMERIC, DataTypeFamily.DATETIME
+            new DataTypeRoot[] {
+                DataTypeRoot.CHAR,
+                DataTypeRoot.STRING,
+                DataTypeRoot.TINYINT,
+                DataTypeRoot.SMALLINT,
+                DataTypeRoot.INTEGER,
+                DataTypeRoot.BIGINT,
+                DataTypeRoot.FLOAT,
+                DataTypeRoot.DOUBLE,
+                DataTypeRoot.DECIMAL,
+                DataTypeRoot.DATE,
+                DataTypeRoot.TIME_WITHOUT_TIME_ZONE,
+                DataTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE,
+                DataTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE
             }),
     MIN(
             Collections.emptySet(),
-            new DataTypeFamily[] {
-                DataTypeFamily.CHARACTER_STRING, DataTypeFamily.NUMERIC, DataTypeFamily.DATETIME
+            new DataTypeRoot[] {
+                DataTypeRoot.CHAR,
+                DataTypeRoot.STRING,
+                DataTypeRoot.TINYINT,
+                DataTypeRoot.SMALLINT,
+                DataTypeRoot.INTEGER,
+                DataTypeRoot.BIGINT,
+                DataTypeRoot.FLOAT,
+                DataTypeRoot.DOUBLE,
+                DataTypeRoot.DECIMAL,
+                DataTypeRoot.DATE,
+                DataTypeRoot.TIME_WITHOUT_TIME_ZONE,
+                DataTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE,
+                DataTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE
             }),
 
     // Value selection
-    LAST_VALUE(Collections.emptySet(), DataTypeFamily.values()),
-    LAST_VALUE_IGNORE_NULLS(Collections.emptySet(), DataTypeFamily.values()),
-    FIRST_VALUE(Collections.emptySet(), DataTypeFamily.values()),
-    FIRST_VALUE_IGNORE_NULLS(Collections.emptySet(), DataTypeFamily.values()),
+    LAST_VALUE(Collections.emptySet(), DataTypeRoot.values()),
+    LAST_VALUE_IGNORE_NULLS(Collections.emptySet(), DataTypeRoot.values()),
+    FIRST_VALUE(Collections.emptySet(), DataTypeRoot.values()),
+    FIRST_VALUE_IGNORE_NULLS(Collections.emptySet(), DataTypeRoot.values()),
 
     // String aggregation
     LISTAGG(
             Collections.singleton(AggFunctions.PARAM_DELIMITER),
-            new DataTypeFamily[] {DataTypeFamily.CHARACTER_STRING}),
+            new DataTypeRoot[] {DataTypeRoot.STRING, DataTypeRoot.CHAR}),
     // Alias for LISTAGG - maps to same factory
     STRING_AGG(
             Collections.singleton(AggFunctions.PARAM_DELIMITER),
-            new DataTypeFamily[] {DataTypeFamily.CHARACTER_STRING}),
+            new DataTypeRoot[] {DataTypeRoot.STRING, DataTypeRoot.CHAR}),
 
     // Boolean aggregation
-    BOOL_AND(Collections.emptySet(), new DataTypeFamily[0]),
-    BOOL_OR(Collections.emptySet(), new DataTypeFamily[0]);
+    BOOL_AND(Collections.emptySet(), new DataTypeRoot[] {DataTypeRoot.BOOLEAN}),
+    BOOL_OR(Collections.emptySet(), new DataTypeRoot[] {DataTypeRoot.BOOLEAN}),
+
+    // Roaring bitmap aggregation
+    RBM32(Collections.emptySet(), new DataTypeRoot[] {DataTypeRoot.BYTES}),
+    RBM64(Collections.emptySet(), new DataTypeRoot[] {DataTypeRoot.BYTES});
 
     private final Set<String> supportedParameters;
 
-    private final DataTypeFamily[] supportedDataTypeFamilies;
+    private final DataTypeRoot[] supportedDataTypeRoots;
 
-    AggFunctionType(Set<String> supportedParameters, DataTypeFamily[] supportedDataTypeFamilies) {
+    AggFunctionType(Set<String> supportedParameters, DataTypeRoot[] supportedDataTypeRoots) {
         this.supportedParameters = supportedParameters;
-        this.supportedDataTypeFamilies = supportedDataTypeFamilies;
+        this.supportedDataTypeRoots = supportedDataTypeRoots;
     }
 
     /**
@@ -126,26 +173,12 @@ public enum AggFunctionType {
      * @throws IllegalArgumentException if the data type is invalid
      */
     public void validateDataType(DataType fieldType) {
-        switch (this) {
-                // The bool_and and bool_or don't have specific DataFamily, validate them by
-                // dataType directly.
-            case BOOL_AND:
-            case BOOL_OR:
-                checkArgument(
-                        fieldType instanceof BooleanType,
-                        "Data type for %s column must be 'BooleanType' but was '%s'.",
-                        toString(),
-                        fieldType);
-                break;
-            default:
-                checkArgument(
-                        fieldType.isAnyOf(this.supportedDataTypeFamilies),
-                        "Data type for %s column must be part of %s but was '%s'.",
-                        toString(),
-                        Arrays.deepToString(this.supportedDataTypeFamilies),
-                        fieldType);
-                break;
-        }
+        checkArgument(
+                fieldType.isAnyOf(this.supportedDataTypeRoots),
+                "Data type for %s column must be part of %s but was '%s'.",
+                toString(),
+                Arrays.deepToString(this.supportedDataTypeRoots),
+                fieldType);
     }
 
     /**
@@ -190,5 +223,9 @@ public enum AggFunctionType {
     @Override
     public String toString() {
         return name().toLowerCase(Locale.ROOT);
+    }
+
+    public DataTypeRoot[] getSupportedDataTypeRoots() {
+        return supportedDataTypeRoots;
     }
 }

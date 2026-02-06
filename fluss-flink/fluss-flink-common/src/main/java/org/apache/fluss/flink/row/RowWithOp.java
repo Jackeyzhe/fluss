@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.row;
 
+import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.row.InternalRow;
 
 import javax.annotation.Nullable;
@@ -42,6 +43,8 @@ public class RowWithOp {
     /** The type of operation associated with this row (e.g., APPEND, UPSERT, DELETE). */
     private final OperationType opType;
 
+    private final Long estimatedSizeInBytes;
+
     /**
      * Constructs a {@code RowWithOp} with the specified internal row and operation type.
      *
@@ -49,9 +52,24 @@ public class RowWithOp {
      * @param opType the operation type (must not be null)
      * @throws NullPointerException if {@code row} or {@code opType} is null
      */
-    public RowWithOp(InternalRow row, @Nullable OperationType opType) {
+    public RowWithOp(InternalRow row, OperationType opType) {
+        this(row, opType, null);
+    }
+
+    /**
+     * Constructs a {@code RowWithOp} with the specified internal row and operation type.
+     *
+     * @param row the internal row data (must not be null)
+     * @param opType the operation type (must not be null)
+     * @param estimatedSizeInBytes the estimated size in bytes of the row, this is used to collect
+     *     statistics for partitions and dynamically adjust the shuffle routes for better
+     *     performance when {@link DistributionMode#PARTITION_DYNAMIC} is enabled.
+     * @throws NullPointerException if {@code row} or {@code opType} is null
+     */
+    public RowWithOp(InternalRow row, OperationType opType, @Nullable Long estimatedSizeInBytes) {
         this.row = checkNotNull(row, "row cannot be null");
         this.opType = checkNotNull(opType, "opType cannot be null");
+        this.estimatedSizeInBytes = estimatedSizeInBytes;
     }
 
     /**
@@ -70,6 +88,14 @@ public class RowWithOp {
      */
     public OperationType getOperationType() {
         return opType;
+    }
+
+    /**
+     * Returns the estimated size in bytes of the row. Can be null if it is not calculated when the
+     * {@link RowWithOp} was created.
+     */
+    public @Nullable Long getEstimatedSizeInBytes() {
+        return estimatedSizeInBytes;
     }
 
     /**

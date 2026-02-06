@@ -23,6 +23,7 @@ import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.rebalance.GoalType;
+import org.apache.fluss.cluster.rebalance.RebalanceProgress;
 import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.cluster.AlterConfig;
@@ -54,6 +55,7 @@ import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.exception.TooManyPartitionsException;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
+import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
@@ -66,8 +68,12 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
 
+import javax.annotation.Nullable;
+
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -173,6 +179,20 @@ public interface Admin extends AutoCloseable {
 
     /** List all databases in fluss cluster asynchronously. */
     CompletableFuture<List<String>> listDatabases();
+
+    /**
+     * List all databases' summary information in fluss cluster asynchronously. The difference
+     * between this method and {@link #listDatabases()} is that this method also include some
+     * summaries for the database, like {@link DatabaseSummary#getCreatedTime()} and {@link
+     * DatabaseSummary#getTableCount()}.
+     *
+     * <p>When interacting older version of fluss cluster which does not support this API, it will
+     * fall back to {@link #listDatabases()} with {@code -1} value for {@link
+     * DatabaseSummary#getCreatedTime()} and {@link DatabaseSummary#getTableCount()}.
+     *
+     * @since 0.9
+     */
+    CompletableFuture<List<DatabaseSummary>> listDatabaseSummaries();
 
     /**
      * Create a new table asynchronously.
@@ -551,21 +571,22 @@ public interface Admin extends AutoCloseable {
      * balancing according to the user-defined {@code priorityGoals}.
      *
      * <p>Currently, Fluss only supports one active rebalance task in the cluster. If an uncompleted
-     * rebalance task exists, an {@link RebalanceFailureException} will be thrown.
+     * rebalance task exists, Fluss will return the uncompleted rebalance task's progress.
+     *
+     * <p>If you want to cancel the rebalance task, you can use {@link #cancelRebalance(String)}
      *
      * <ul>
      *   <li>{@link AuthorizationException} If the authenticated user doesn't have cluster
      *       permissions.
-     *   <li>{@link RebalanceFailureException} If the rebalance failed. Such as there is an ongoing
-     *       execution.
+     *   <li>{@link RebalanceFailureException} If the rebalance failed. Such as there is an
+     *       inProgress execution.
      * </ul>
      *
      * @param priorityGoals the goals to be optimized.
-     * @param dryRun Calculate and return the rebalance optimization proposal, but do not execute
-     *     it.
-     * @return the generated rebalance plan for all the tableBuckets which need to do rebalance.
+     * @return the rebalance id. If there is no rebalance task in progress, it will trigger a new
+     *     rebalance task and return the rebalance id.
      */
-    CompletableFuture<RebalancePlan> rebalance(List<GoalType> priorityGoals, boolean dryRun);
+    CompletableFuture<String> rebalance(List<GoalType> priorityGoals);
 
     /**
      * List the rebalance progress.
@@ -573,12 +594,16 @@ public interface Admin extends AutoCloseable {
      * <ul>
      *   <li>{@link AuthorizationException} If the authenticated user doesn't have cluster
      *       permissions.
-     *   <li>{@link NoRebalanceInProgressException} If there are no rebalance tasks in progress.
+     *   <li>{@link NoRebalanceInProgressException} If there are no rebalance tasks in progress for
+     *       the input rebalanceId.
      * </ul>
      *
+     * @param rebalanceId the rebalance id to list progress, if it is null means list the in
+     *     progress rebalance task's.
      * @return the rebalance process.
      */
-    CompletableFuture<RebalanceProgress> listRebalanceProgress();
+    CompletableFuture<Optional<RebalanceProgress>> listRebalanceProgress(
+            @Nullable String rebalanceId);
 
     /**
      * Cannel the rebalance task.
@@ -586,8 +611,74 @@ public interface Admin extends AutoCloseable {
      * <ul>
      *   <li>{@link AuthorizationException} If the authenticated user doesn't have cluster
      *       permissions.
-     *   <li>{@link NoRebalanceInProgressException} If there are no rebalance tasks in progress.
+     *   <li>{@link NoRebalanceInProgressException} If there are no rebalance tasks in progress or
+     *       the rebalance id is not exists.
      * </ul>
+     *
+     * @param rebalanceId the rebalance id to cancel, if it is null means cancel the exists
+     *     rebalance task. If rebalanceId is not exists in server, {@link
+     *     NoRebalanceInProgressException} will be thrown.
      */
-    CompletableFuture<Void> cancelRebalance();
+    CompletableFuture<Void> cancelRebalance(@Nullable String rebalanceId);
+
+    // ==================================================================================
+    // Producer Offset Management APIs (for Exactly-Once Semantics)
+    // ==================================================================================
+
+    /**
+     * Register producer offset snapshot.
+     *
+     * <p>This method provides atomic "check and register" semantics:
+     *
+     * <ul>
+     *   <li>If snapshot does not exist: create new snapshot and return {@link
+     *       RegisterResult#CREATED}
+     *   <li>If snapshot already exists: do NOT overwrite and return {@link
+     *       RegisterResult#ALREADY_EXISTS}
+     * </ul>
+     *
+     * <p>The atomicity is guaranteed by the server implementation. This enables the caller to
+     * determine whether undo recovery is needed based on the return value.
+     *
+     * <p>The snapshot will be automatically cleaned up after the configured TTL expires.
+     *
+     * <p>This API is typically used by Flink Operator Coordinator at job startup to register the
+     * initial offset snapshot before any data is written.
+     *
+     * @param producerId the ID of the producer (typically Flink job ID)
+     * @param offsets map of TableBucket to offset for all tables
+     * @return a CompletableFuture containing the registration result indicating whether the
+     *     snapshot was newly created or already existed
+     * @since 0.9
+     */
+    CompletableFuture<RegisterResult> registerProducerOffsets(
+            String producerId, Map<TableBucket, Long> offsets);
+
+    /**
+     * Get producer offset snapshot.
+     *
+     * <p>This method retrieves the registered offset snapshot for a producer. Returns null if no
+     * snapshot exists for the given producer ID.
+     *
+     * <p>This API is typically used by Flink Operator Coordinator at job startup to check if a
+     * previous snapshot exists (indicating a failover before first checkpoint).
+     *
+     * @param producerId the ID of the producer
+     * @return a CompletableFuture containing the producer offsets, or null if not found
+     * @since 0.9
+     */
+    CompletableFuture<ProducerOffsetsResult> getProducerOffsets(String producerId);
+
+    /**
+     * Delete producer offset snapshot.
+     *
+     * <p>This method deletes the registered offset snapshot for a producer. This is typically
+     * called after the first checkpoint completes successfully, as the checkpoint state will be
+     * used for recovery instead of the initial snapshot.
+     *
+     * @param producerId the ID of the producer
+     * @return a CompletableFuture that completes when deletion succeeds
+     * @since 0.9
+     */
+    CompletableFuture<Void> deleteProducerOffsets(String producerId);
 }

@@ -93,9 +93,12 @@ message DatabaseExistsResponse {
 
 // list databases request and response
 message ListDatabasesRequest {
+  optional bool include_summary = 1;
 }
+
 message ListDatabasesResponse {
   repeated string database_name = 1;
+  repeated PbDatabaseSummary database_summary = 2;
 }
 
 // create table request and response
@@ -219,6 +222,11 @@ message FetchLogResponse {
   repeated PbFetchLogRespForTable tables_resp = 1;
 }
 
+// Aggregation mode constants for write operations (using int32 instead of enum for proto3 compatibility)
+// AGG_MODE_AGGREGATE = 0: Data is aggregated through server-side merge engine (default)
+// AGG_MODE_OVERWRITE = 1: Bypass merge engine, directly replace values (for undo recovery)
+// AGG_MODE_LOCAL_AGGREGATE = 2: Client-side local aggregation (reserved for future implementation)
+
 // put kv request and response
 message PutKvRequest {
   required int32 acks = 1;
@@ -228,6 +236,9 @@ message PutKvRequest {
   // if empty, means write all columns
   repeated int32 target_columns = 4 [packed = true];
   repeated PbPutKvReqForBucket buckets_req = 5;
+  // Aggregation mode for this request (see AGG_MODE_* constants above)
+  // 0 = AGGREGATE (default), 1 = OVERWRITE, 2 = LOCAL_AGGREGATE (not yet supported)
+  optional int32 agg_mode = 6;
 }
 
 message PutKvResponse {
@@ -238,6 +249,9 @@ message PutKvResponse {
 message LookupRequest {
   required int64 table_id = 1;
   repeated PbLookupReqForBucket buckets_req = 2;
+  optional bool insert_if_not_exists = 3;
+  optional int32 acks = 4;
+  optional int32 timeout_ms = 5;
 }
 
 message LookupResponse {
@@ -540,6 +554,12 @@ message LakeTieringHeartbeatRequest {
   repeated PbHeartbeatReqForTable failed_tables = 3;
   // whether to request a table
   optional bool request_table = 4;
+  // Table IDs that were force finished due to reaching the maximum tiering duration.
+  // When a table's tiering operation exceeds the max duration (data lake freshness),
+  // it will be force finished to prevent it from blocking other tables' tiering operations.
+  // These table IDs must also appear in finished_tables. The coordinator uses this field to
+  // distinguish between normally finished tables and force finished tables.
+  repeated int64 force_finished_tables = 5;
 }
 
 message LakeTieringHeartbeatResponse {
@@ -594,24 +614,62 @@ message RemoveServerTagResponse {
 
 message RebalanceRequest {
   repeated int32 goals = 1 [packed = true];
-  required bool dry_run = 2;
 }
 
 message RebalanceResponse {
-  repeated PbRebalancePlanForTable table_plan = 1;
+  required string rebalance_id = 1;
 }
 
 message ListRebalanceProgressRequest {
+  optional string rebalance_id = 1;
 }
 
 message ListRebalanceProgressResponse {
-  repeated PbRebalanceProgressForTable table_progress = 1;
+  optional string rebalance_id = 1;
+  optional int32 rebalance_status = 2;
+  repeated PbRebalanceProgressForTable table_progress = 3;
 }
 
 message CancelRebalanceRequest {
+  optional string rebalance_id = 1;
 }
 
 message CancelRebalanceResponse {
+}
+
+// ------------------------------------------------------------------------------------------
+// Producer Offset Management
+// ------------------------------------------------------------------------------------------
+
+// Register producer offsets request and response
+message RegisterProducerOffsetsRequest {
+  required string producer_id = 1;
+  repeated PbProducerTableOffsets table_offsets = 2;
+  optional int64 ttl_ms = 3;
+}
+
+message RegisterProducerOffsetsResponse {
+  // Result of registration: 0 = CREATED (new snapshot), 1 = ALREADY_EXISTS (snapshot existed)
+  optional int32 result = 1;
+}
+
+// Get producer offsets request and response
+message GetProducerOffsetsRequest {
+  required string producer_id = 1;
+}
+
+message GetProducerOffsetsResponse {
+  optional string producer_id = 1;
+  optional int64 expiration_time = 2;
+  repeated PbProducerTableOffsets table_offsets = 3;
+}
+
+// Delete producer offsets request and response
+message DeleteProducerOffsetsRequest {
+  required string producer_id = 1;
+}
+
+message DeleteProducerOffsetsResponse {
 }
 
 
@@ -735,6 +793,9 @@ message PbPutKvRespForBucket {
   required int32 bucket_id = 2;
   optional int32 error_code = 3;
   optional string error_message = 4;
+  // the log end offset (LEO) of the changelog after this write
+  // this is the offset of the next record to be written, used for exactly-once semantics
+  optional int64 log_end_offset = 5;
 }
 
 message PbLookupReqForBucket {
@@ -841,7 +902,13 @@ message PbNotifyLeaderAndIsrRespForBucket {
 message PbStopReplicaReqForBucket {
   required PbTableBucket table_bucket = 1;
   required int32 leader_epoch = 2;
+  // delete means remove local replica data (i.e., data stored on the current node).
   required bool delete = 3;
+  // deleteRemote means remove remote replica data (e.g., data in object storage) and was introduced in v0.9.
+  // For backward compatibility, if a request does not include the deleteRemote flag, the system treats delete as
+  // deleteRemote (i.e., it falls back to remote deletion). This ensures older CoordinatorServer continues to function
+  // correctly with newer TabletServers.
+  optional bool deleteRemote = 4;
 }
 
 message PbStopReplicaRespForBucket {
@@ -1059,4 +1126,16 @@ message PbBucketOffset {
   optional int64 partition_id = 1;
   required int32 bucket_id = 2;
   optional int64 log_end_offset = 4;
+}
+
+// Helper message for table offsets in producer offsets (without table_path)
+message PbProducerTableOffsets {
+  required int64 table_id = 1;
+  repeated PbBucketOffset bucket_offsets = 2;
+}
+
+message PbDatabaseSummary {
+  required string database_name = 1;
+  required int64 created_time = 2;
+  required int32 table_count = 3;
 }

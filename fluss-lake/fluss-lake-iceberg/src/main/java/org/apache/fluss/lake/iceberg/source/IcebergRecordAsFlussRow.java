@@ -34,6 +34,7 @@ import java.nio.ByteBuffer;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 
 import static org.apache.fluss.lake.iceberg.IcebergLakeCatalog.SYSTEM_COLUMNS;
 
@@ -43,6 +44,10 @@ public class IcebergRecordAsFlussRow implements InternalRow {
     private Record icebergRecord;
 
     public IcebergRecordAsFlussRow() {}
+
+    public IcebergRecordAsFlussRow(Record icebergRecord) {
+        this.icebergRecord = icebergRecord;
+    }
 
     public IcebergRecordAsFlussRow replaceIcebergRecord(Record icebergRecord) {
         this.icebergRecord = icebergRecord;
@@ -163,13 +168,28 @@ public class IcebergRecordAsFlussRow implements InternalRow {
 
     @Override
     public InternalMap getMap(int pos) {
-        // TODO: Support Map type conversion from Iceberg to Fluss
-        throw new UnsupportedOperationException();
+        Object value = icebergRecord.get(pos);
+        if (value == null) {
+            return null;
+        }
+        Map<?, ?> icebergMap = (Map<?, ?>) value;
+        return new IcebergMapAsFlussMap(icebergMap);
     }
 
     @Override
     public InternalRow getRow(int pos, int numFields) {
-        // TODO: Support Row type conversion from Iceberg to Fluss
-        throw new UnsupportedOperationException();
+        Object value = icebergRecord.get(pos);
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Record) {
+            return new IcebergRecordAsFlussRow((Record) value);
+        } else {
+            throw new IllegalArgumentException(
+                    "Expected Iceberg Record for nested row at position "
+                            + pos
+                            + " but found: "
+                            + value.getClass().getName());
+        }
     }
 }

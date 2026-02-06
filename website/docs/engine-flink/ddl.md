@@ -236,9 +236,13 @@ Currently, this feature has the following characteristics:
 - **Position**: New columns are always appended to the end of the existing column list.
 - **Nullability**: Only nullable columns can be added to an existing table to ensure compatibility with existing data.
 - **Type Support**: You can add columns of any data type, including complex types such as `ROW`, `MAP`, and `ARRAY`.
-- **Nested Fields**: Currently, adding fields within an existing nested `ROW` is not supported. Such operations are categorized as "updating column types" and will be supported in future versions.
 
-You can add a single column or multiple columns using the `ALTER TABLE statement.
+The following limitations currently apply but will be supported in the future:
+
+- **Nested Fields**: Adding fields within an existing nested `ROW` is not supported. Such operations are categorized as "updating column types" and will be supported in future versions.
+- **AUTO INCREMENT**: Adding `AUTO_INCREMENT` columns by using `ALTER TABLE` is not supported; such columns must be defined when the table is created.
+
+You can add a single column or multiple columns using the `ALTER TABLE` statement.
 
 ```sql title="Flink SQL"
 -- Add a single column at the end of the table
@@ -261,9 +265,14 @@ When using SET to modify [Storage Options](engine-flink/options.md#storage-optio
 - All [Read Options](engine-flink/options.md#read-options), [Write Options](engine-flink/options.md#write-options), [Lookup Options](engine-flink/options.md#lookup-options) and [Other Options](engine-flink/options.md#other-options) except `bootstrap.servers`.
 - The following [Storage Options](engine-flink/options.md#storage-options):
   - `table.datalake.enabled`: Enable or disable lakehouse storage for the table.
+  - `table.datalake.freshness`: Set the data freshness for lakehouse storage.
 
 ```sql title="Flink SQL"
+-- Enable lakehouse storage for the table
 ALTER TABLE my_table SET ('table.datalake.enabled' = 'true');
+
+-- Set the freshness to 5 minutes for lakehouse storage
+ALTER TABLE my_table SET ('table.datalake.freshness' = '5min');
 ```
 
 **Limits**

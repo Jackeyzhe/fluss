@@ -36,6 +36,8 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.TabletManagerBase;
+import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
+import org.apache.fluss.server.kv.autoinc.ZkSequenceGeneratorFactory;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
@@ -248,6 +250,13 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
 
                     File tabletDir = getOrCreateTabletDir(tablePath, tableBucket);
                     RowMerger merger = RowMerger.create(tableConfig, kvFormat, schemaGetter);
+                    AutoIncrementManager autoIncrementManager =
+                            new AutoIncrementManager(
+                                    schemaGetter,
+                                    tablePath.getTablePath(),
+                                    tableConfig,
+                                    new ZkSequenceGeneratorFactory(zkClient));
+
                     KvTablet tablet =
                             KvTablet.create(
                                     tablePath,
@@ -263,7 +272,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     arrowCompressionInfo,
                                     schemaGetter,
                                     tableConfig.getChangelogImage(),
-                                    sharedRocksDBRateLimiter);
+                                    sharedRocksDBRateLimiter,
+                                    autoIncrementManager);
                     currentKvs.put(tableBucket, tablet);
 
                     LOG.info(
@@ -358,6 +368,12 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         TableConfig tableConfig = tableInfo.getTableConfig();
         RowMerger rowMerger =
                 RowMerger.create(tableConfig, tableConfig.getKvFormat(), schemaGetter);
+        AutoIncrementManager autoIncrementManager =
+                new AutoIncrementManager(
+                        schemaGetter,
+                        tablePath,
+                        tableConfig,
+                        new ZkSequenceGeneratorFactory(zkClient));
         KvTablet kvTablet =
                 KvTablet.create(
                         physicalTablePath,
@@ -373,7 +389,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         tableConfig.getArrowCompressionInfo(),
                         schemaGetter,
                         tableConfig.getChangelogImage(),
-                        sharedRocksDBRateLimiter);
+                        sharedRocksDBRateLimiter,
+                        autoIncrementManager);
         if (this.currentKvs.containsKey(tableBucket)) {
             throw new IllegalStateException(
                     String.format(

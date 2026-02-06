@@ -17,6 +17,7 @@
 
 package org.apache.fluss.client.admin;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.KvSnapshotMetadata;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
@@ -25,12 +26,14 @@ import org.apache.fluss.client.utils.ClientRpcMessageUtils;
 import org.apache.fluss.cluster.Cluster;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.rebalance.GoalType;
+import org.apache.fluss.cluster.rebalance.RebalanceProgress;
 import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.ConfigEntry;
 import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
+import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -49,11 +52,13 @@ import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.AddServerTagRequest;
 import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
+import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
 import org.apache.fluss.rpc.messages.CreateAclsRequest;
 import org.apache.fluss.rpc.messages.CreateDatabaseRequest;
 import org.apache.fluss.rpc.messages.CreateTableRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsResponse;
+import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.DropAclsRequest;
 import org.apache.fluss.rpc.messages.DropDatabaseRequest;
@@ -62,6 +67,7 @@ import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataRequest;
 import org.apache.fluss.rpc.messages.GetLatestKvSnapshotsRequest;
 import org.apache.fluss.rpc.messages.GetLatestLakeSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.GetTableInfoRequest;
 import org.apache.fluss.rpc.messages.GetTableSchemaRequest;
 import org.apache.fluss.rpc.messages.ListAclsRequest;
@@ -69,12 +75,15 @@ import org.apache.fluss.rpc.messages.ListDatabasesRequest;
 import org.apache.fluss.rpc.messages.ListDatabasesResponse;
 import org.apache.fluss.rpc.messages.ListOffsetsRequest;
 import org.apache.fluss.rpc.messages.ListPartitionInfosRequest;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressRequest;
 import org.apache.fluss.rpc.messages.ListTablesRequest;
 import org.apache.fluss.rpc.messages.ListTablesResponse;
 import org.apache.fluss.rpc.messages.PbAlterConfig;
 import org.apache.fluss.rpc.messages.PbListOffsetsRespForBucket;
 import org.apache.fluss.rpc.messages.PbPartitionSpec;
 import org.apache.fluss.rpc.messages.PbTablePath;
+import org.apache.fluss.rpc.messages.RebalanceRequest;
+import org.apache.fluss.rpc.messages.RebalanceResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.TableExistsRequest;
 import org.apache.fluss.rpc.messages.TableExistsResponse;
@@ -91,6 +100,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeAlterTableRequest;
@@ -98,6 +108,7 @@ import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeCreatePart
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeDropPartitionRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeListOffsetsRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makePbPartitionSpec;
+import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeRegisterProducerOffsetsRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.toConfigEntries;
 import static org.apache.fluss.client.utils.MetadataUtils.sendMetadataRequestAndRebuildCluster;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toAclBindings;
@@ -233,6 +244,14 @@ public class FlussAdmin implements Admin {
         return readOnlyGateway
                 .listDatabases(request)
                 .thenApply(ListDatabasesResponse::getDatabaseNamesList);
+    }
+
+    @Override
+    public CompletableFuture<List<DatabaseSummary>> listDatabaseSummaries() {
+        ListDatabasesRequest request = new ListDatabasesRequest().setIncludeSummary(true);
+        return readOnlyGateway
+                .listDatabases(request)
+                .thenApply(ClientRpcMessageUtils::toDatabaseSummaries);
     }
 
     @Override
@@ -551,19 +570,77 @@ public class FlussAdmin implements Admin {
     }
 
     @Override
-    public CompletableFuture<RebalancePlan> rebalance(
-            List<GoalType> priorityGoals, boolean dryRun) {
-        throw new UnsupportedOperationException("Support soon");
+    public CompletableFuture<String> rebalance(List<GoalType> priorityGoals) {
+        RebalanceRequest request = new RebalanceRequest();
+        priorityGoals.forEach(goal -> request.addGoal(goal.value));
+        return gateway.rebalance(request).thenApply(RebalanceResponse::getRebalanceId);
     }
 
     @Override
-    public CompletableFuture<RebalanceProgress> listRebalanceProgress() {
-        throw new UnsupportedOperationException("Support soon");
+    public CompletableFuture<Optional<RebalanceProgress>> listRebalanceProgress(
+            @Nullable String rebalanceId) {
+        ListRebalanceProgressRequest request = new ListRebalanceProgressRequest();
+
+        if (rebalanceId != null) {
+            request.setRebalanceId(rebalanceId);
+        }
+
+        return gateway.listRebalanceProgress(request)
+                .thenApply(ClientRpcMessageUtils::toRebalanceProgress);
     }
 
     @Override
-    public CompletableFuture<Void> cancelRebalance() {
-        throw new UnsupportedOperationException("Support soon");
+    public CompletableFuture<Void> cancelRebalance(@Nullable String rebalanceId) {
+        CancelRebalanceRequest request = new CancelRebalanceRequest();
+
+        if (rebalanceId != null) {
+            request.setRebalanceId(rebalanceId);
+        }
+
+        return gateway.cancelRebalance(request).thenApply(r -> null);
+    }
+
+    // ==================================================================================
+    // Producer Offset Management APIs (for Exactly-Once Semantics)
+    // ==================================================================================
+
+    @Override
+    public CompletableFuture<RegisterResult> registerProducerOffsets(
+            String producerId, Map<TableBucket, Long> offsets) {
+        checkNotNull(producerId, "producerId must not be null");
+        checkNotNull(offsets, "offsets must not be null");
+
+        return gateway.registerProducerOffsets(
+                        makeRegisterProducerOffsetsRequest(producerId, offsets))
+                .thenApply(
+                        response -> {
+                            int code =
+                                    response.hasResult()
+                                            ? response.getResult()
+                                            : RegisterResult.CREATED.getCode();
+                            return RegisterResult.fromCode(code);
+                        });
+    }
+
+    @Override
+    public CompletableFuture<ProducerOffsetsResult> getProducerOffsets(String producerId) {
+        checkNotNull(producerId, "producerId must not be null");
+
+        GetProducerOffsetsRequest request = new GetProducerOffsetsRequest();
+        request.setProducerId(producerId);
+
+        return gateway.getProducerOffsets(request)
+                .thenApply(ClientRpcMessageUtils::toProducerOffsetsResult);
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteProducerOffsets(String producerId) {
+        checkNotNull(producerId, "producerId must not be null");
+
+        DeleteProducerOffsetsRequest request = new DeleteProducerOffsetsRequest();
+        request.setProducerId(producerId);
+
+        return gateway.deleteProducerOffsets(request).thenApply(r -> null);
     }
 
     @Override
@@ -627,5 +704,15 @@ public class FlussAdmin implements Admin {
                                         });
                     }
                 });
+    }
+
+    @VisibleForTesting
+    public AdminGateway getAdminGateway() {
+        return gateway;
+    }
+
+    @VisibleForTesting
+    public AdminReadOnlyGateway getAdminReadOnlyGateway() {
+        return readOnlyGateway;
     }
 }

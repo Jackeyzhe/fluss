@@ -23,11 +23,13 @@ import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.Decimal;
 import org.apache.fluss.row.GenericArray;
+import org.apache.fluss.row.GenericMap;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.TimestampLtz;
@@ -139,8 +141,16 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         String partitionName =
                 isPartitioned ? waitUntilPartitions(t1).values().iterator().next() : null;
         if (partitionName != null) {
-            queryFilterStr = queryFilterStr + " and c18= '" + partitionName + "'";
+            queryFilterStr = queryFilterStr + " and c19= '" + partitionName + "'";
         }
+
+        Map<String, Integer> flinkMap1 = new HashMap<>();
+        flinkMap1.put("key1", 1);
+        flinkMap1.put("key2", 2);
+
+        Map<String, Integer> flinkMap2 = new HashMap<>();
+        flinkMap2.put("key3", 3);
+        flinkMap2.put("key4", 4);
 
         List<Row> expectedRows = new ArrayList<>();
         if (isPartitioned) {
@@ -164,6 +174,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 new byte[] {1, 2, 3, 4},
                                 new float[] {1.1f, 1.2f, 1.3f},
                                 Row.of(100, "nested_value_1", 3.14),
+                                flinkMap1,
                                 partition));
 
                 expectedRows.add(
@@ -185,6 +196,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 new byte[] {1, 2, 3, 4},
                                 new float[] {1.1f, 1.2f, 1.3f},
                                 Row.of(200, "nested_value_2", 6.28),
+                                flinkMap2,
                                 partition));
             }
         } else {
@@ -227,6 +239,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                     new byte[] {1, 2, 3, 4},
                                     new float[] {1.1f, 1.2f, 1.3f},
                                     Row.of(200, "nested_value_2", 6.28),
+                                    flinkMap2,
                                     null));
         }
         tableResult =
@@ -240,7 +253,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 row -> {
                                     boolean isMatch = row.getField(3).equals(30);
                                     if (partitionName != null) {
-                                        isMatch = isMatch && row.getField(17).equals(partitionName);
+                                        isMatch = isMatch && row.getField(18).equals(partitionName);
                                     }
                                     return isMatch;
                                 })
@@ -295,6 +308,10 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
             writeFullTypeRow(t1, null);
         }
 
+        Map<String, Integer> flinkMap3 = new HashMap<>();
+        flinkMap3.put("key5", 5);
+        flinkMap3.put("key6", 6);
+
         expectedRows = new ArrayList<>();
         if (isPartitioned) {
             for (String partition : waitUntilPartitions(t1).values()) {
@@ -317,6 +334,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 new byte[] {1, 2, 3, 4},
                                 new float[] {1.1f, 1.2f, 1.3f},
                                 Row.of(100, "nested_value_1", 3.14),
+                                flinkMap1,
                                 partition));
 
                 expectedRows.add(
@@ -338,6 +356,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 new byte[] {5, 6, 7, 8},
                                 new float[] {2.1f, 2.2f, 2.3f},
                                 Row.of(300, "nested_value_3", 9.99),
+                                flinkMap3,
                                 partition));
             }
         } else {
@@ -380,6 +399,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                     new byte[] {5, 6, 7, 8},
                                     new float[] {2.1f, 2.2f, 2.3f},
                                     Row.of(300, "nested_value_3", 9.99),
+                                    flinkMap3,
                                     null));
         }
 
@@ -408,6 +428,75 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                         .map(row -> Row.of(row.getField(2))) // c3
                         .collect(Collectors.toList());
         assertThat(projectRows2.toString()).isEqualTo(sortedRows(expectedProjectRows2).toString());
+    }
+
+    @Test
+    void testUnionReadNotDefaultBucketKeyTable() throws Exception {
+        // When bucket key is a subset of primary key, Fluss uses CompactedKeyEncoder instead of
+        // Paimon's encoder. This test verifies that looking up data by primary key from Paimon
+        // and union read still works correctly.
+        JobClient jobClient = buildTieringJob(execEnv);
+
+        String tableName = "pk_table_not_default_bucket_key";
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+
+        int bucketNum = 3;
+
+        // Create table with primary key (c1, c2) but bucket key (c1) - a subset of PK
+        Schema schema =
+                Schema.newBuilder()
+                        .column("c1", DataTypes.INT())
+                        .column("c2", DataTypes.STRING())
+                        .column("c3", DataTypes.STRING())
+                        .primaryKey("c1", "c2")
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(3, "c1") // bucket key is subset of PK
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(100))
+                        .build();
+        long tableId = createTable(tablePath, tableDescriptor);
+
+        // Write data
+        List<InternalRow> rows = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            rows.add(row(i, BinaryString.fromString("a" + i), BinaryString.fromString("v" + i)));
+        }
+        writeRows(tablePath, rows, false);
+
+        Map<TableBucket, Long> bucketLogEndOffset = getBucketLogEndOffset(tableId, bucketNum, null);
+
+        // Wait until records have been synced to Paimon
+        assertReplicaStatus(bucketLogEndOffset);
+
+        // Stop tiering to ensure we read from Paimon snapshot
+        jobClient.cancel().get();
+
+        List<String> result =
+                toSortedRows(
+                        batchTEnv.executeSql(
+                                "select c1, c2, c3 from "
+                                        + tableName
+                                        + "$lake where c1 = 0 and c2 = 'a0'"));
+        // Query by primary key from Paimon - this verifies that even though Fluss uses
+        // CompactedKeyEncoder (not Paimon's encoder), we can still correctly look up data
+        // from Paimon by primary key as we use paimon bucket. If not use paimon bucket, the
+        // assertion will fail
+        assertThat(result.toString()).isEqualTo("[+I[0, a0, v0]]");
+
+        // Query all data to verify union read works
+        rows = new ArrayList<>();
+        List<String> expectedRows = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            rows.add(row(i, BinaryString.fromString("a" + i), BinaryString.fromString("vv" + i)));
+            expectedRows.add(Row.of(i, "a" + i, "vv" + i).toString());
+        }
+        writeRows(tablePath, rows, false);
+
+        result = toSortedRows(batchTEnv.executeSql("select * from " + tableName));
+        assertThat(result).containsExactlyInAnyOrderElementsOf(expectedRows);
     }
 
     @Test
@@ -475,6 +564,14 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         // check the status of replica after synced
         assertReplicaStatus(bucketLogEndOffset);
 
+        Map<String, Integer> streamMap1 = new HashMap<>();
+        streamMap1.put("key1", 1);
+        streamMap1.put("key2", 2);
+
+        Map<String, Integer> streamMap2 = new HashMap<>();
+        streamMap2.put("key3", 3);
+        streamMap2.put("key4", 4);
+
         // will read paimon snapshot, should only +I since no change log
         List<Row> expectedRows = new ArrayList<>();
         if (isPartitioned) {
@@ -498,6 +595,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 new byte[] {1, 2, 3, 4},
                                 new float[] {1.1f, 1.2f, 1.3f},
                                 Row.of(100, "nested_value_1", 3.14),
+                                streamMap1,
                                 partition));
                 expectedRows.add(
                         Row.of(
@@ -518,6 +616,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 new byte[] {1, 2, 3, 4},
                                 new float[] {1.1f, 1.2f, 1.3f},
                                 Row.of(200, "nested_value_2", 6.28),
+                                streamMap2,
                                 partition));
             }
         } else {
@@ -541,6 +640,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                     new byte[] {1, 2, 3, 4},
                                     new float[] {1.1f, 1.2f, 1.3f},
                                     Row.of(100, "nested_value_1", 3.14),
+                                    streamMap1,
                                     null),
                             Row.of(
                                     true,
@@ -560,6 +660,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                     new byte[] {1, 2, 3, 4},
                                     new float[] {1.1f, 1.2f, 1.3f},
                                     Row.of(200, "nested_value_2", 6.28),
+                                    streamMap2,
                                     null));
         }
 
@@ -579,6 +680,10 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         } else {
             writeFullTypeRow(t1, null);
         }
+
+        Map<String, Integer> streamMap3 = new HashMap<>();
+        streamMap3.put("key5", 5);
+        streamMap3.put("key6", 6);
 
         // should generate -U & +U
         List<Row> expectedRows2 = new ArrayList<>();
@@ -604,6 +709,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 new byte[] {1, 2, 3, 4},
                                 new float[] {1.1f, 1.2f, 1.3f},
                                 Row.of(200, "nested_value_2", 6.28),
+                                streamMap2,
                                 partition));
                 expectedRows2.add(
                         Row.ofKind(
@@ -625,6 +731,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 new byte[] {5, 6, 7, 8},
                                 new float[] {2.1f, 2.2f, 2.3f},
                                 Row.of(300, "nested_value_3", 9.99),
+                                streamMap3,
                                 partition));
             }
         } else {
@@ -648,6 +755,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                             new byte[] {1, 2, 3, 4},
                             new float[] {1.1f, 1.2f, 1.3f},
                             Row.of(200, "nested_value_2", 6.28),
+                            streamMap2,
                             null));
             expectedRows2.add(
                     Row.ofKind(
@@ -669,6 +777,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                             new byte[] {5, 6, 7, 8},
                             new float[] {2.1f, 2.2f, 2.3f},
                             Row.of(300, "nested_value_3", 9.99),
+                            streamMap3,
                             null));
         }
 
@@ -804,6 +913,105 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
         // cancel jobs
         insertResult.getJobClient().get().cancel().get();
         jobClient.cancel().get();
+    }
+
+    @Test
+    void testUnionReadWithAddColumn() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "unionReadAddColumnPKTable");
+
+        // 1. Create PK Table (Lake Enabled)
+        Schema schema =
+                Schema.newBuilder()
+                        .column("c1", DataTypes.INT())
+                        .column("c2", DataTypes.STRING())
+                        .primaryKey("c1")
+                        .build();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(schema)
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
+                        .build();
+
+        long tableId = createTable(tablePath, tableDescriptor);
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+
+        // 2. Write initial data
+        List<InternalRow> initialRows = Arrays.asList(row(1, "v1"), row(2, "v2"));
+        writeRows(tablePath, initialRows, false);
+
+        // 3. Start tiering job
+        JobClient jobClient = buildTieringJob(execEnv);
+
+        try {
+            // 4. Wait for data to snapshot to Paimon
+            assertReplicaStatus(tableBucket, 2);
+
+            // 5. Add Column "c3"
+            List<TableChange> addColumnChanges =
+                    Collections.singletonList(
+                            TableChange.addColumn(
+                                    "c3",
+                                    DataTypes.INT(),
+                                    "new column",
+                                    TableChange.ColumnPosition.last()));
+            admin.alterTable(tablePath, addColumnChanges, false).get();
+
+            // 6. Write new data (Update Key 2, Insert Key 3)
+            // Updating key 2 validates that union read correctly merges
+            // the new schema data from log with old schema data from Paimon
+            List<InternalRow> newRows = Arrays.asList(row(2, "v2_updated", 20), row(3, "v3", 30));
+            writeRows(tablePath, newRows, false);
+
+            // 7. Query via Flink SQL
+            CloseableIterator<Row> iterator =
+                    batchTEnv.executeSql("SELECT * FROM " + tablePath.getTableName()).collect();
+
+            // 8. Verify union read correctly handles schema evolution with PK updates:
+            // - Key 1: from Paimon snapshot (old schema, c3 should be null)
+            // - Key 2: from Fluss log (updated value, new schema)
+            // - Key 3: from Fluss log (new insert, new schema)
+            List<String> actualRows = collectRowsWithTimeout(iterator, 3, true);
+
+            assertThat(actualRows)
+                    .containsExactlyInAnyOrder(
+                            "+I[1, v1, null]", "+I[2, v2_updated, 20]", "+I[3, v3, 30]");
+
+            // 9. Add Column "c4" (Schema V3)
+            // Verify union read reconciles tiered data (V1) with a fluss log
+            // containing multiple schema versions (V2 and V3).
+            jobClient.cancel().get();
+            addColumnChanges =
+                    Collections.singletonList(
+                            TableChange.addColumn(
+                                    "c4",
+                                    DataTypes.INT(),
+                                    "another new column",
+                                    TableChange.ColumnPosition.last()));
+            admin.alterTable(tablePath, addColumnChanges, false).get();
+
+            // 10. Write data for Schema V3 (Update Key 2 and Key 3)
+            newRows =
+                    Arrays.asList(row(2, "v2_updated_again", 20, 30), row(3, "v3_update", 30, 40));
+            writeRows(tablePath, newRows, false);
+
+            // 11. Final Query Verify (Paimon V1 + Log V2 + Log V3)
+            // - Key 1: from Paimon snapshot (oldest schema, c3/c4 should be null)
+            // - Key 2: from Fluss log (latest update, newest schema)
+            // - Key 3: from Fluss log (latest update, newest schema)
+            iterator = batchTEnv.executeSql("SELECT * FROM " + tablePath.getTableName()).collect();
+            actualRows = collectRowsWithTimeout(iterator, 3, true);
+
+            assertThat(actualRows)
+                    .containsExactlyInAnyOrder(
+                            "+I[1, v1, null, null]",
+                            "+I[2, v2_updated_again, 20, 30]",
+                            "+I[3, v3_update, 30, 40]");
+        } finally {
+            jobClient.cancel().get();
+        }
     }
 
     @Test
@@ -1002,21 +1210,21 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                         + "2023-10-25T12:01:13.182005Z, "
                         + "2023-10-25T12:01:13.183, "
                         + "2023-10-25T12:01:13.183006, "
-                        + "[1, 2, 3, 4], [1.1, 1.2, 1.3], +I[100, nested_value_1, 3.14], %s]");
+                        + "[1, 2, 3, 4], [1.1, 1.2, 1.3], +I[100, nested_value_1, 3.14], {key1=1, key2=2}, %s]");
         records.add(
                 "+I[true, 10, 20, 30, 40, 50.1, 60.0, another_string, 0.90, 100, "
                         + "2023-10-25T12:01:13.200Z, "
                         + "2023-10-25T12:01:13.200005Z, "
                         + "2023-10-25T12:01:13.201, "
                         + "2023-10-25T12:01:13.201006, "
-                        + "[1, 2, 3, 4], [1.1, 1.2, 1.3], +I[200, nested_value_2, 6.28], %s]");
+                        + "[1, 2, 3, 4], [1.1, 1.2, 1.3], +I[200, nested_value_2, 6.28], {key3=3, key4=4}, %s]");
         records.add(
                 "+I[true, 100, 200, 30, 400, 500.1, 600.0, another_string_2, 9.00, 1000, "
                         + "2023-10-25T12:01:13.400Z, "
                         + "2023-10-25T12:01:13.400007Z, "
                         + "2023-10-25T12:01:13.501, "
                         + "2023-10-25T12:01:13.501008, "
-                        + "[5, 6, 7, 8], [2.1, 2.2, 2.3], +I[300, nested_value_3, 9.99], %s]");
+                        + "[5, 6, 7, 8], [2.1, 2.2, 2.3], +I[300, nested_value_3, 9.99], {key5=5, key6=6}, %s]");
 
         if (isPartitioned) {
             return String.format(
@@ -1059,9 +1267,10 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                         DataTypes.FIELD("nested_int", DataTypes.INT()),
                                         DataTypes.FIELD("nested_string", DataTypes.STRING()),
                                         DataTypes.FIELD("nested_double", DataTypes.DOUBLE())))
-                        .column("c18", DataTypes.STRING());
+                        .column("c18", DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()))
+                        .column("c19", DataTypes.STRING());
 
-        return createPkTable(tablePath, bucketNum, isPartitioned, true, schemaBuilder, "c4", "c18");
+        return createPkTable(tablePath, bucketNum, isPartitioned, true, schemaBuilder, "c4", "c19");
     }
 
     protected long createSimplePkTable(
@@ -1108,6 +1317,10 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
     }
 
     private void writeFullTypeRow(TablePath tablePath, String partition) throws Exception {
+        Map<Object, Object> map3 = new HashMap<>();
+        map3.put(BinaryString.fromString("key5"), 5);
+        map3.put(BinaryString.fromString("key6"), 6);
+
         List<InternalRow> rows =
                 Collections.singletonList(
                         row(
@@ -1128,11 +1341,20 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                                 new byte[] {5, 6, 7, 8},
                                 new GenericArray(new float[] {2.1f, 2.2f, 2.3f}),
                                 GenericRow.of(300, BinaryString.fromString("nested_value_3"), 9.99),
+                                new GenericMap(map3),
                                 partition));
         writeRows(tablePath, rows, false);
     }
 
     private static List<InternalRow> generateKvRowsFullType(@Nullable String partition) {
+        Map<Object, Object> map1 = new HashMap<>();
+        map1.put(BinaryString.fromString("key1"), 1);
+        map1.put(BinaryString.fromString("key2"), 2);
+
+        Map<Object, Object> map2 = new HashMap<>();
+        map2.put(BinaryString.fromString("key3"), 3);
+        map2.put(BinaryString.fromString("key4"), 4);
+
         return Arrays.asList(
                 row(
                         false,
@@ -1152,6 +1374,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                         new byte[] {1, 2, 3, 4},
                         new GenericArray(new float[] {1.1f, 1.2f, 1.3f}),
                         GenericRow.of(100, BinaryString.fromString("nested_value_1"), 3.14),
+                        new GenericMap(map1),
                         partition),
                 row(
                         true,
@@ -1171,6 +1394,7 @@ class FlinkUnionReadPrimaryKeyTableITCase extends FlinkUnionReadTestBase {
                         new byte[] {1, 2, 3, 4},
                         new GenericArray(new float[] {1.1f, 1.2f, 1.3f}),
                         GenericRow.of(200, BinaryString.fromString("nested_value_2"), 6.28),
+                        new GenericMap(map2),
                         partition));
     }
 }

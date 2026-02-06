@@ -18,6 +18,7 @@
 package org.apache.fluss.client.utils;
 
 import org.apache.fluss.client.admin.OffsetSpec;
+import org.apache.fluss.client.admin.ProducerOffsetsResult;
 import org.apache.fluss.client.lookup.LookupBatch;
 import org.apache.fluss.client.lookup.PrefixLookupBatch;
 import org.apache.fluss.client.metadata.KvSnapshotMetadata;
@@ -25,12 +26,17 @@ import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.write.KvWriteBatch;
 import org.apache.fluss.client.write.ReadyWriteBatch;
+import org.apache.fluss.cluster.rebalance.RebalancePlanForBucket;
+import org.apache.fluss.cluster.rebalance.RebalanceProgress;
+import org.apache.fluss.cluster.rebalance.RebalanceResultForBucket;
+import org.apache.fluss.cluster.rebalance.RebalanceStatus;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.config.cluster.ColumnPositionType;
 import org.apache.fluss.config.cluster.ConfigEntry;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.FsPathAndFileName;
 import org.apache.fluss.fs.token.ObtainedSecurityToken;
+import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -44,12 +50,17 @@ import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenResponse;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataResponse;
 import org.apache.fluss.rpc.messages.GetLatestKvSnapshotsResponse;
 import org.apache.fluss.rpc.messages.GetLatestLakeSnapshotResponse;
+import org.apache.fluss.rpc.messages.GetProducerOffsetsResponse;
+import org.apache.fluss.rpc.messages.ListDatabasesResponse;
 import org.apache.fluss.rpc.messages.ListOffsetsRequest;
 import org.apache.fluss.rpc.messages.ListPartitionInfosResponse;
+import org.apache.fluss.rpc.messages.ListRebalanceProgressResponse;
 import org.apache.fluss.rpc.messages.LookupRequest;
 import org.apache.fluss.rpc.messages.MetadataRequest;
 import org.apache.fluss.rpc.messages.PbAddColumn;
 import org.apache.fluss.rpc.messages.PbAlterConfig;
+import org.apache.fluss.rpc.messages.PbBucketOffset;
+import org.apache.fluss.rpc.messages.PbDatabaseSummary;
 import org.apache.fluss.rpc.messages.PbDescribeConfig;
 import org.apache.fluss.rpc.messages.PbDropColumn;
 import org.apache.fluss.rpc.messages.PbKeyValue;
@@ -60,12 +71,18 @@ import org.apache.fluss.rpc.messages.PbModifyColumn;
 import org.apache.fluss.rpc.messages.PbPartitionSpec;
 import org.apache.fluss.rpc.messages.PbPrefixLookupReqForBucket;
 import org.apache.fluss.rpc.messages.PbProduceLogReqForBucket;
+import org.apache.fluss.rpc.messages.PbProducerTableOffsets;
 import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
+import org.apache.fluss.rpc.messages.PbRebalancePlanForBucket;
+import org.apache.fluss.rpc.messages.PbRebalanceProgressForBucket;
+import org.apache.fluss.rpc.messages.PbRebalanceProgressForTable;
 import org.apache.fluss.rpc.messages.PbRemotePathAndLocalFile;
 import org.apache.fluss.rpc.messages.PbRenameColumn;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.PutKvRequest;
+import org.apache.fluss.rpc.messages.RegisterProducerOffsetsRequest;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.utils.json.DataTypeJsonSerde;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 
@@ -77,10 +94,13 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.cluster.rebalance.RebalanceStatus.FINAL_STATUSES;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toResolvedPartitionSpec;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkState;
 
 /**
@@ -122,11 +142,12 @@ public class ClientRpcMessageUtils {
                         .setTimeoutMs(maxRequestTimeoutMs);
         // check the target columns in the batch list should be the same. If not same,
         // we throw exception directly currently.
-        int[] targetColumns =
-                ((KvWriteBatch) readyWriteBatches.get(0).writeBatch()).getTargetColumns();
+        KvWriteBatch firstBatch = (KvWriteBatch) readyWriteBatches.get(0).writeBatch();
+        int[] targetColumns = firstBatch.getTargetColumns();
+        MergeMode mergeMode = firstBatch.getMergeMode();
         for (int i = 1; i < readyWriteBatches.size(); i++) {
-            int[] currentBatchTargetColumns =
-                    ((KvWriteBatch) readyWriteBatches.get(i).writeBatch()).getTargetColumns();
+            KvWriteBatch currentBatch = (KvWriteBatch) readyWriteBatches.get(i).writeBatch();
+            int[] currentBatchTargetColumns = currentBatch.getTargetColumns();
             if (!Arrays.equals(targetColumns, currentBatchTargetColumns)) {
                 throw new IllegalStateException(
                         String.format(
@@ -135,10 +156,21 @@ public class ClientRpcMessageUtils {
                                 Arrays.toString(targetColumns),
                                 Arrays.toString(currentBatchTargetColumns)));
             }
+            // Validate mergeMode consistency across batches
+            if (currentBatch.getMergeMode() != mergeMode) {
+                throw new IllegalStateException(
+                        String.format(
+                                "All the write batches to make put kv request should have the same mergeMode, "
+                                        + "but got %s and %s.",
+                                mergeMode, currentBatch.getMergeMode()));
+            }
         }
         if (targetColumns != null) {
             request.setTargetColumns(targetColumns);
         }
+        // Set mergeMode in the request - this is the proper way to pass mergeMode to server
+        request.setAggMode(mergeMode.getProtoValue());
+
         readyWriteBatches.forEach(
                 readyBatch -> {
                     TableBucket tableBucket = readyBatch.tableBucket();
@@ -370,6 +402,65 @@ public class ClientRpcMessageUtils {
         return request;
     }
 
+    public static Optional<RebalanceProgress> toRebalanceProgress(
+            ListRebalanceProgressResponse response) {
+        if (!response.hasRebalanceId()) {
+            return Optional.empty();
+        }
+
+        checkArgument(response.hasRebalanceStatus(), "Rebalance status is not set");
+        RebalanceStatus totalRebalanceStatus = RebalanceStatus.of(response.getRebalanceStatus());
+        int totalTask = 0;
+        int finishedTask = 0;
+        Map<TableBucket, RebalanceResultForBucket> rebalanceProgress = new HashMap<>();
+        for (PbRebalanceProgressForTable pbTable : response.getTableProgressesList()) {
+            long tableId = pbTable.getTableId();
+            for (PbRebalanceProgressForBucket pbBucket : pbTable.getBucketsProgressesList()) {
+                RebalanceStatus bucketStatus = RebalanceStatus.of(pbBucket.getRebalanceStatus());
+                RebalancePlanForBucket planForBucket =
+                        toRebalancePlanForBucket(tableId, pbBucket.getRebalancePlan());
+                rebalanceProgress.put(
+                        planForBucket.getTableBucket(),
+                        new RebalanceResultForBucket(planForBucket, bucketStatus));
+                if (FINAL_STATUSES.contains(bucketStatus)) {
+                    finishedTask++;
+                }
+                totalTask++;
+            }
+        }
+
+        // For these rebalance task without only bucket level rebalance tasks, we return -1 as
+        // progress.
+        double progress = -1d;
+        if (totalTask != 0) {
+            progress = (double) finishedTask / totalTask;
+        }
+
+        return Optional.of(
+                new RebalanceProgress(
+                        response.getRebalanceId(),
+                        totalRebalanceStatus,
+                        progress,
+                        rebalanceProgress));
+    }
+
+    private static RebalancePlanForBucket toRebalancePlanForBucket(
+            long tableId, PbRebalancePlanForBucket rebalancePlan) {
+        TableBucket tableBucket =
+                new TableBucket(
+                        tableId,
+                        rebalancePlan.hasPartitionId() ? rebalancePlan.getPartitionId() : null,
+                        rebalancePlan.getBucketId());
+        return new RebalancePlanForBucket(
+                tableBucket,
+                rebalancePlan.getOriginalLeader(),
+                rebalancePlan.getNewLeader(),
+                Arrays.stream(rebalancePlan.getOriginalReplicas())
+                        .boxed()
+                        .collect(Collectors.toList()),
+                Arrays.stream(rebalancePlan.getNewReplicas()).boxed().collect(Collectors.toList()));
+    }
+
     public static List<PartitionInfo> toPartitionInfos(ListPartitionInfosResponse response) {
         return response.getPartitionsInfosList().stream()
                 .map(
@@ -471,5 +562,111 @@ public class ClientRpcMessageUtils {
                                         ConfigEntry.ConfigSource.valueOf(
                                                 pbDescribeConfig.getConfigSource())))
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * Parses a PbProducerTableOffsets into a map of TableBucket to offset.
+     *
+     * @param pbTableOffsets the protobuf producer table offsets
+     * @return map of TableBucket to offset
+     */
+    public static Map<TableBucket, Long> toTableBucketOffsets(
+            PbProducerTableOffsets pbTableOffsets) {
+        Map<TableBucket, Long> bucketOffsets = new HashMap<>();
+        long tableId = pbTableOffsets.getTableId();
+
+        for (PbBucketOffset pbBucketOffset : pbTableOffsets.getBucketOffsetsList()) {
+            Long partitionId =
+                    pbBucketOffset.hasPartitionId() ? pbBucketOffset.getPartitionId() : null;
+            TableBucket bucket =
+                    new TableBucket(tableId, partitionId, pbBucketOffset.getBucketId());
+            bucketOffsets.put(bucket, pbBucketOffset.getLogEndOffset());
+        }
+
+        return bucketOffsets;
+    }
+
+    /**
+     * Creates a RegisterProducerOffsetsRequest from producer ID and offsets map.
+     *
+     * @param producerId the producer ID
+     * @param offsets map of TableBucket to offset
+     * @return the RegisterProducerOffsetsRequest
+     */
+    public static RegisterProducerOffsetsRequest makeRegisterProducerOffsetsRequest(
+            String producerId, Map<TableBucket, Long> offsets) {
+        RegisterProducerOffsetsRequest request = new RegisterProducerOffsetsRequest();
+        request.setProducerId(producerId);
+
+        // Group offsets by table ID
+        Map<Long, List<Map.Entry<TableBucket, Long>>> offsetsByTable = new HashMap<>();
+        for (Map.Entry<TableBucket, Long> entry : offsets.entrySet()) {
+            offsetsByTable
+                    .computeIfAbsent(entry.getKey().getTableId(), k -> new ArrayList<>())
+                    .add(entry);
+        }
+
+        // Build PbProducerTableOffsets for each table
+        for (Map.Entry<Long, List<Map.Entry<TableBucket, Long>>> tableEntry :
+                offsetsByTable.entrySet()) {
+            PbProducerTableOffsets pbTableOffsets =
+                    request.addTableOffset().setTableId(tableEntry.getKey());
+            for (Map.Entry<TableBucket, Long> bucketEntry : tableEntry.getValue()) {
+                TableBucket bucket = bucketEntry.getKey();
+                PbBucketOffset pbBucketOffset =
+                        pbTableOffsets
+                                .addBucketOffset()
+                                .setBucketId(bucket.getBucket())
+                                .setLogEndOffset(bucketEntry.getValue());
+                if (bucket.getPartitionId() != null) {
+                    pbBucketOffset.setPartitionId(bucket.getPartitionId());
+                }
+            }
+        }
+
+        return request;
+    }
+
+    /**
+     * Converts a GetProducerOffsetsResponse to ProducerOffsetsResult.
+     *
+     * @param response the GetProducerOffsetsResponse
+     * @return the ProducerOffsetsResult, or null if producer not found
+     */
+    @Nullable
+    public static ProducerOffsetsResult toProducerOffsetsResult(
+            GetProducerOffsetsResponse response) {
+        if (!response.hasProducerId()) {
+            return null;
+        }
+
+        Map<Long, Map<TableBucket, Long>> tableOffsets = new HashMap<>();
+        for (PbProducerTableOffsets pbTableOffsets : response.getTableOffsetsList()) {
+            long tableId = pbTableOffsets.getTableId();
+            tableOffsets.put(tableId, toTableBucketOffsets(pbTableOffsets));
+        }
+
+        long expirationTime = response.hasExpirationTime() ? response.getExpirationTime() : 0;
+        return new ProducerOffsetsResult(response.getProducerId(), tableOffsets, expirationTime);
+    }
+
+    public static List<DatabaseSummary> toDatabaseSummaries(ListDatabasesResponse response) {
+        List<DatabaseSummary> databaseSummaries = new ArrayList<>();
+        for (PbDatabaseSummary pbDatabaseSummary : response.getDatabaseSummariesList()) {
+            databaseSummaries.add(
+                    new DatabaseSummary(
+                            pbDatabaseSummary.getDatabaseName(),
+                            pbDatabaseSummary.getCreatedTime(),
+                            pbDatabaseSummary.getTableCount()));
+        }
+
+        if (response.getDatabaseNamesCount() > 0 && response.getDatabaseSummariesCount() == 0) {
+            // backward-compatibility for older server versions that only returns database names
+            for (String dbName : response.getDatabaseNamesList()) {
+                databaseSummaries.add(new DatabaseSummary(dbName, -1L, -1));
+            }
+        }
+
+        return databaseSummaries;
     }
 }

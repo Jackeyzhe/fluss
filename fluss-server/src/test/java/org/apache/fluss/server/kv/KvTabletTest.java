@@ -36,6 +36,9 @@ import org.apache.fluss.record.FileLogProjection;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordTestUtils;
+import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.LogTestBase;
 import org.apache.fluss.record.MemoryLogRecords;
@@ -45,6 +48,8 @@ import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.record.bytesview.MultiBytesView;
 import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
+import org.apache.fluss.server.kv.autoinc.TestingSequenceGeneratorFactory;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.KvEntry;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Value;
@@ -60,6 +65,7 @@ import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.types.StringType;
+import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
 
@@ -83,6 +89,8 @@ import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
 import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
@@ -121,7 +129,7 @@ class KvTabletTest {
 
     @BeforeEach
     void beforeEach() {
-        executor = Executors.newFixedThreadPool(2);
+        executor = Executors.newFixedThreadPool(3);
     }
 
     @AfterEach
@@ -181,6 +189,13 @@ class KvTabletTest {
             throws Exception {
         TableConfig tableConf = new TableConfig(Configuration.fromMap(tableConfig));
         RowMerger rowMerger = RowMerger.create(tableConf, KvFormat.COMPACTED, schemaGetter);
+        AutoIncrementManager autoIncrementManager =
+                new AutoIncrementManager(
+                        schemaGetter,
+                        tablePath.getTablePath(),
+                        new TableConfig(new Configuration()),
+                        new TestingSequenceGeneratorFactory());
+
         return KvTablet.create(
                 tablePath,
                 tableBucket,
@@ -195,7 +210,8 @@ class KvTabletTest {
                 DEFAULT_COMPRESSION,
                 schemaGetter,
                 tableConf.getChangelogImage(),
-                KvManager.getDefaultRateLimiter());
+                KvManager.getDefaultRateLimiter(),
+                autoIncrementManager);
     }
 
     @Test
@@ -274,17 +290,11 @@ class KvTabletTest {
                                 0,
                                 Arrays.asList(
                                         // -- for batch 1
-                                        ChangeType.INSERT,
-                                        ChangeType.INSERT,
-                                        ChangeType.UPDATE_BEFORE,
-                                        ChangeType.UPDATE_AFTER),
+                                        ChangeType.INSERT, ChangeType.INSERT),
                                 Arrays.asList(
                                         // for k1
                                         new Object[] {1, null, null},
-                                        // for k2: +I
-                                        new Object[] {2, null, null},
-                                        // for k2: -U, +U
-                                        new Object[] {2, null, null},
+                                        // for k2: +I, the second K2 update is skipped
                                         new Object[] {2, null, null})));
 
         LogRecords actualLogRecords = readLogRecords();
@@ -592,6 +602,99 @@ class KvTabletTest {
     }
 
     @Test
+    void testAutoIncrementWithMultiThread() throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("user_name", DataTypes.STRING())
+                        .column("uid", DataTypes.INT())
+                        .primaryKey("user_name")
+                        .enableAutoIncrement("uid")
+                        .build();
+        initLogTabletAndKvTablet(schema, new HashMap<>());
+        KvRecordTestUtils.KvRecordFactory recordFactory =
+                KvRecordTestUtils.KvRecordFactory.of(
+                        schema.getRowType().project(Collections.singletonList("user_name")));
+
+        // start threads to put records
+        List<Future<LogAppendInfo>> putFutures = new ArrayList<>();
+        for (int i = 1; i <= 30; ) {
+            String k1 = "k" + i++;
+            String k2 = "k" + i++;
+            String k3 = "k" + i++;
+            KvRecordBatch kvRecordBatch1 =
+                    kvRecordBatchFactory.ofRecords(
+                            Arrays.asList(
+                                    recordFactory.ofRecord(k1.getBytes(), new Object[] {k1}),
+                                    recordFactory.ofRecord(k2.getBytes(), new Object[] {k2}),
+                                    recordFactory.ofRecord(k3.getBytes(), new Object[] {k3})));
+            // test concurrent putting to test thread-safety of AutoIncrementManager
+            putFutures.add(
+                    executor.submit(() -> kvTablet.putAsLeader(kvRecordBatch1, new int[] {0})));
+        }
+
+        // wait for all putting finished
+        for (Future<LogAppendInfo> future : putFutures) {
+            future.get();
+        }
+
+        LogRecords actualLogRecords = readLogRecords(logTablet, 0L, null);
+        LogRecordReadContext context =
+                LogRecordReadContext.createArrowReadContext(
+                        schema.getRowType(), schemaId, schemaGetter);
+        List<Integer> actualUids = new ArrayList<>();
+        for (LogRecordBatch actualNext : actualLogRecords.batches()) {
+            CloseableIterator<LogRecord> iterator = actualNext.records(context);
+            while (iterator.hasNext()) {
+                LogRecord record = iterator.next();
+                assertThat(record.getChangeType()).isEqualTo(ChangeType.INSERT);
+                assertThat(record.getRow().isNullAt(1)).isFalse();
+                actualUids.add(record.getRow().getInt(1));
+            }
+        }
+        // create a List from 1 to 30
+        List<Integer> expectedUids =
+                IntStream.rangeClosed(1, 30).boxed().collect(Collectors.toList());
+        assertThat(actualUids).isEqualTo(expectedUids);
+    }
+
+    @Test
+    void testAutoIncrementWithInvalidTargetColumns() throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("user_name", DataTypes.STRING())
+                        .column("uid", DataTypes.INT())
+                        .column("age", DataTypes.INT())
+                        .primaryKey("user_name")
+                        .enableAutoIncrement("uid")
+                        .build();
+        initLogTabletAndKvTablet(schema, new HashMap<>());
+        KvRecordTestUtils.KvRecordFactory recordFactory =
+                KvRecordTestUtils.KvRecordFactory.of(schema.getRowType());
+
+        KvRecordBatch kvRecordBatch =
+                kvRecordBatchFactory.ofRecords(
+                        Arrays.asList(
+                                recordFactory.ofRecord(
+                                        "k1".getBytes(), new Object[] {"k1", null, null}),
+                                recordFactory.ofRecord(
+                                        "k2".getBytes(), new Object[] {"k2", null, null})));
+        // target columns contain auto-increment column
+        assertThatThrownBy(() -> kvTablet.putAsLeader(kvRecordBatch, new int[] {0, 1}))
+                .isInstanceOf(InvalidTargetColumnException.class)
+                .hasMessageContaining(
+                        "Auto-increment column [uid] at index 1 must not be included in target columns.");
+
+        // no specify target columns, which is also invalid for auto-increment
+        assertThatThrownBy(() -> kvTablet.putAsLeader(kvRecordBatch, null))
+                .isInstanceOf(InvalidTargetColumnException.class)
+                .hasMessageContaining(
+                        "The table contains an auto-increment column [uid], but update target columns are not explicitly specified.");
+
+        // valid case: target columns don't contain auto-increment column
+        kvTablet.putAsLeader(kvRecordBatch, new int[] {0, 2});
+    }
+
+    @Test
     void testPutAsLeaderWithOutOfOrderSequenceException() throws Exception {
         initLogTabletAndKvTablet(DATA1_SCHEMA_PK, new HashMap<>());
         long writeId = 100L;
@@ -702,26 +805,20 @@ class KvTabletTest {
             kvTablet.putAsLeader(kvRecordBatch2, null);
             endOffset = logTablet.localLogEndOffset();
             assertThat(endOffset).isEqualTo(offsetBefore + i + 1);
+            MemoryLogRecords emptyLogs =
+                    logRecords(
+                            readLogRowType,
+                            offsetBefore + i,
+                            Collections.emptyList(),
+                            Collections.emptyList());
+            MultiBytesView bytesView =
+                    MultiBytesView.builder()
+                            .addBytes(
+                                    expectedLogs.getMemorySegment(), 0, expectedLogs.sizeInBytes())
+                            .addBytes(emptyLogs.getMemorySegment(), 0, emptyLogs.sizeInBytes())
+                            .build();
+            expectedLogs = MemoryLogRecords.pointToBytesView(bytesView);
 
-            // the empty batch will be read if no projection,
-            // the empty batch will not be read if has projection
-            if (!doProjection) {
-                MemoryLogRecords emptyLogs =
-                        logRecords(
-                                readLogRowType,
-                                offsetBefore + i,
-                                Collections.emptyList(),
-                                Collections.emptyList());
-                MultiBytesView bytesView =
-                        MultiBytesView.builder()
-                                .addBytes(
-                                        expectedLogs.getMemorySegment(),
-                                        0,
-                                        expectedLogs.sizeInBytes())
-                                .addBytes(emptyLogs.getMemorySegment(), 0, emptyLogs.sizeInBytes())
-                                .build();
-                expectedLogs = MemoryLogRecords.pointToBytesView(bytesView);
-            }
             actualLogRecords = readLogRecords(logTablet, 0, logProjection);
             assertThatLogRecords(actualLogRecords)
                     .withSchema(readLogRowType)
@@ -898,31 +995,25 @@ class KvTabletTest {
             endOffset = logTablet.localLogEndOffset();
             assertThat(endOffset).isEqualTo(offsetBefore + i + 1);
 
-            // the empty batch will be read if no projection,
-            // the empty batch will not be read if has projection
-            if (!doProjection) {
-                MemoryLogRecords emptyLogs =
-                        logRecords(
-                                readLogRowType,
-                                offsetBefore + i,
-                                Collections.emptyList(),
-                                Collections.emptyList());
-                MultiBytesView bytesView =
-                        MultiBytesView.builder()
-                                .addBytes(
-                                        expectedLogs.getMemorySegment(),
-                                        0,
-                                        expectedLogs.sizeInBytes())
-                                .addBytes(emptyLogs.getMemorySegment(), 0, emptyLogs.sizeInBytes())
-                                .build();
-                expectedLogs = MemoryLogRecords.pointToBytesView(bytesView);
-            }
-            actualLogRecords = readLogRecords(logTablet, 0, logProjection);
-            assertThatLogRecords(actualLogRecords)
-                    .withSchema(readLogRowType)
-                    .assertCheckSum(!doProjection)
-                    .isEqualTo(expectedLogs);
+            MemoryLogRecords emptyLogs =
+                    logRecords(
+                            readLogRowType,
+                            offsetBefore + i,
+                            Collections.emptyList(),
+                            Collections.emptyList());
+            MultiBytesView bytesView =
+                    MultiBytesView.builder()
+                            .addBytes(
+                                    expectedLogs.getMemorySegment(), 0, expectedLogs.sizeInBytes())
+                            .addBytes(emptyLogs.getMemorySegment(), 0, emptyLogs.sizeInBytes())
+                            .build();
+            expectedLogs = MemoryLogRecords.pointToBytesView(bytesView);
         }
+        actualLogRecords = readLogRecords(logTablet, 0, logProjection);
+        assertThatLogRecords(actualLogRecords)
+                .withSchema(readLogRowType)
+                .assertCheckSum(!doProjection)
+                .isEqualTo(expectedLogs);
 
         List<KvRecord> kvData3 =
                 Arrays.asList(
@@ -1510,6 +1601,45 @@ class KvTabletTest {
                 .as("Total memory usage must be positive")
                 .isGreaterThan(0);
 
+        // ========== Phase 5.1: Verify Fine-Grained Memory Metrics ==========
+        // All fine-grained memory metrics should be non-negative
+        long memTableUsage = statistics.getMemTableMemoryUsage();
+        assertThat(memTableUsage)
+                .as("MemTable memory usage should be non-negative")
+                .isGreaterThanOrEqualTo(0);
+
+        long memTableUnFlushedUsage = statistics.getMemTableUnFlushedMemoryUsage();
+        assertThat(memTableUnFlushedUsage)
+                .as("Unflushed memtable memory usage should be non-negative")
+                .isGreaterThanOrEqualTo(0);
+
+        long tableReadersUsage = statistics.getTableReadersMemoryUsage();
+        assertThat(tableReadersUsage)
+                .as("Table readers memory usage should be non-negative")
+                .isGreaterThanOrEqualTo(0);
+
+        long blockCacheMemoryUsage = statistics.getBlockCacheMemoryUsage();
+        assertThat(blockCacheMemoryUsage)
+                .as("Block cache memory usage should be non-negative")
+                .isGreaterThanOrEqualTo(0);
+
+        long blockCachePinnedUsage = statistics.getBlockCachePinnedUsage();
+        assertThat(blockCachePinnedUsage)
+                .as("Block cache pinned usage should be non-negative")
+                .isGreaterThanOrEqualTo(0);
+
+        // Total memory usage should be at least as large as any individual component
+        long totalMemoryUsage = statistics.getTotalMemoryUsage();
+        assertThat(totalMemoryUsage)
+                .as("Total memory should be at least as large as memtable usage")
+                .isGreaterThanOrEqualTo(memTableUsage);
+        assertThat(totalMemoryUsage)
+                .as("Total memory should be at least as large as table readers usage")
+                .isGreaterThanOrEqualTo(tableReadersUsage);
+        assertThat(totalMemoryUsage)
+                .as("Total memory should be at least as large as block cache usage")
+                .isGreaterThanOrEqualTo(blockCacheMemoryUsage);
+
         // ========== Phase 6: Verify Metrics After Close ==========
         kvTablet.close();
 
@@ -1526,5 +1656,12 @@ class KvTabletTest {
         assertThat(statistics.getCompactionBytesWritten()).isEqualTo(0);
         assertThat(statistics.getCompactionTimeMicros()).isEqualTo(0);
         assertThat(statistics.getTotalMemoryUsage()).isEqualTo(0);
+
+        // Fine-grained memory metrics should also return 0 after close
+        assertThat(statistics.getMemTableMemoryUsage()).isEqualTo(0);
+        assertThat(statistics.getMemTableUnFlushedMemoryUsage()).isEqualTo(0);
+        assertThat(statistics.getTableReadersMemoryUsage()).isEqualTo(0);
+        assertThat(statistics.getBlockCacheMemoryUsage()).isEqualTo(0);
+        assertThat(statistics.getBlockCachePinnedUsage()).isEqualTo(0);
     }
 }

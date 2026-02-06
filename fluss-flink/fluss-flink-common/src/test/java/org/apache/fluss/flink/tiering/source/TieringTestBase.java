@@ -52,7 +52,9 @@ import javax.annotation.Nullable;
 
 import java.nio.file.Files;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
@@ -87,7 +89,7 @@ public class TieringTestBase extends AbstractTestBase {
                     .schema(DEFAULT_PK_TABLE_SCHEMA)
                     .distributedBy(DEFAULT_BUCKET_NUM, "id")
                     .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                    .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(200))
+                    .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(10))
                     .build();
 
     protected static final TableDescriptor DEFAULT_LOG_TABLE_DESCRIPTOR =
@@ -96,7 +98,7 @@ public class TieringTestBase extends AbstractTestBase {
                     .distributedBy(DEFAULT_BUCKET_NUM, "id")
                     .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
                     .property(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON)
-                    .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(200))
+                    .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(10))
                     .build();
 
     protected static final TableDescriptor DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR =
@@ -115,7 +117,7 @@ public class TieringTestBase extends AbstractTestBase {
                             AutoPartitionTimeUnit.YEAR)
                     .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
                     .property(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON)
-                    .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
+                    .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(10))
                     .build();
 
     protected static final TableDescriptor DEFAULT_AUTO_PARTITIONED_PK_TABLE_DESCRIPTOR =
@@ -135,7 +137,7 @@ public class TieringTestBase extends AbstractTestBase {
                             AutoPartitionTimeUnit.YEAR)
                     .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
                     .property(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON)
-                    .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
+                    .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(10))
                     .build();
 
     protected static final String DEFAULT_DB = "test-tiering-db";
@@ -179,8 +181,6 @@ public class TieringTestBase extends AbstractTestBase {
 
     private static Configuration flussClusterConfig() {
         Configuration conf = new Configuration();
-        // set snapshot interval to 1s for testing purposes
-        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofSeconds(1));
         // not to clean snapshots for test purpose
         conf.set(ConfigOptions.KV_MAX_RETAINED_SNAPSHOTS, Integer.MAX_VALUE);
 
@@ -219,25 +219,23 @@ public class TieringTestBase extends AbstractTestBase {
         return admin.getTableInfo(tablePath).get().getTableId();
     }
 
-    protected void waitUntilSnapshot(long tableId, long snapshotId) {
-        waitUntilSnapshot(tableId, null, snapshotId);
+    protected void triggerAndWaitSnapshot(long tableId) {
+        List<TableBucket> allBuckets = new ArrayList<>();
+        for (int i = 0; i < DEFAULT_BUCKET_NUM; i++) {
+            allBuckets.add(new TableBucket(tableId, null, i));
+        }
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshots(allBuckets);
     }
 
-    protected void waitUntilPartitionTableSnapshot(
-            long tableId, Map<String, Long> partitionNameByIds, long snapshotId) {
+    protected void triggerAndWaitUntilPartitionTableSnapshot(
+            long tableId, Map<String, Long> partitionNameByIds) {
+        List<TableBucket> allBuckets = new ArrayList<>();
         for (Map.Entry<String, Long> entry : partitionNameByIds.entrySet()) {
             for (int i = 0; i < DEFAULT_BUCKET_NUM; i++) {
-                TableBucket tableBucket = new TableBucket(tableId, entry.getValue(), i);
-                FLUSS_CLUSTER_EXTENSION.waitUntilSnapshotFinished(tableBucket, snapshotId);
+                allBuckets.add(new TableBucket(tableId, entry.getValue(), i));
             }
         }
-    }
-
-    protected void waitUntilSnapshot(long tableId, @Nullable Long partitionId, long snapshotId) {
-        for (int i = 0; i < DEFAULT_BUCKET_NUM; i++) {
-            TableBucket tableBucket = new TableBucket(tableId, partitionId, i);
-            FLUSS_CLUSTER_EXTENSION.waitUntilSnapshotFinished(tableBucket, snapshotId);
-        }
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshots(allBuckets);
     }
 
     protected static Map<Long, Map<Integer, Long>> upsertRowForPartitionedTable(
@@ -273,7 +271,8 @@ public class TieringTestBase extends AbstractTestBase {
         RowType rowType = tableDescriptor.getSchema().getRowType();
         // use lake keyEncoder and bucketAssigner fot tiering tests
         KeyEncoder keyEncoder =
-                KeyEncoder.of(rowType, tableDescriptor.getBucketKeys(), DataLakeFormat.PAIMON);
+                KeyEncoder.ofBucketKeyEncoder(
+                        rowType, tableDescriptor.getBucketKeys(), DataLakeFormat.PAIMON);
         HashBucketAssigner hashBucketAssigner =
                 new HashBucketAssigner(
                         DEFAULT_BUCKET_NUM, BucketingFunction.of(DataLakeFormat.PAIMON));
@@ -327,7 +326,8 @@ public class TieringTestBase extends AbstractTestBase {
         RowType rowType = tableDescriptor.getSchema().getRowType();
         // use lake keyEncoder and bucketAssigner fot tiering tests
         KeyEncoder keyEncoder =
-                KeyEncoder.of(rowType, tableDescriptor.getBucketKeys(), DataLakeFormat.PAIMON);
+                KeyEncoder.ofBucketKeyEncoder(
+                        rowType, tableDescriptor.getBucketKeys(), DataLakeFormat.PAIMON);
         HashBucketAssigner hashBucketAssigner =
                 new HashBucketAssigner(
                         DEFAULT_BUCKET_NUM, BucketingFunction.of(DataLakeFormat.PAIMON));

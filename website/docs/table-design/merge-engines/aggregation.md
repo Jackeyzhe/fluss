@@ -53,6 +53,13 @@ Specify the aggregate function for each non-primary key field using connector op
 'fields.<field-name>.agg' = '<function-name>'
 ```
 
+For functions that require parameters (e.g., `listagg` with custom delimiter):
+
+```sql
+'fields.<field-name>.agg' = '<function-name>',
+'fields.<field-name>.<function-name>.<param-name>' = '<param-value>'
+```
+
 </TabItem>
 <TabItem value="java-client" label="Java Client">
 
@@ -714,7 +721,7 @@ CREATE TABLE test_listagg  (
     'table.merge-engine' = 'aggregation',
     'fields.tags1.agg' = 'listagg',
     'fields.tags2.agg' = 'listagg',
-    'fields.tags2.delimiter' = ';'   -- Specify delimiter inline
+    'fields.tags2.listagg.delimiter' = ';'   -- Specify delimiter as parameter
 );
 
 INSERT INTO test_listagg VALUES
@@ -776,7 +783,7 @@ CREATE TABLE test_string_agg  (
     'table.merge-engine' = 'aggregation',
     'fields.tags1.agg' = 'string_agg',
     'fields.tags2.agg' = 'string_agg',
-    'fields.tags2.delimiter' = ';'   -- Specify delimiter inline
+    'fields.tags2.string_agg.delimiter' = ';'   -- Specify delimiter as parameter
 );
 
 INSERT INTO test_string_agg VALUES
@@ -815,6 +822,80 @@ TableDescriptor.builder()
 
 // Input: (1, 'developer', 'developer'), (1, 'java', 'java'), (1, 'flink', 'flink')
 // Result: (1, 'developer,java,flink', 'developer;java;flink')
+```
+
+</TabItem>
+</Tabs>
+
+### rbm32
+
+Aggregates serialized 32-bit RoaringBitmap values by union.
+
+- **Supported Data Types**: BYTES
+- **Behavior**: ORs incoming bitmaps with the accumulator
+- **Null Handling**: Null values are ignored
+
+**Example:**
+<Tabs>
+<TabItem value="flink-sql" label="Flink SQL" default>
+
+```sql
+CREATE TABLE user_visits (
+    user_id BIGINT,
+    visit_bitmap BYTES,
+    PRIMARY KEY (user_id) NOT ENFORCED
+) WITH (
+    'table.merge-engine' = 'aggregation',
+    'fields.visit_bitmap.agg' = 'rbm32'
+);
+```
+
+</TabItem>
+<TabItem value="java-client" label="Java Client">
+
+```java
+Schema schema = Schema.newBuilder()
+    .column("user_id", DataTypes.BIGINT())
+    .column("visit_bitmap", DataTypes.BYTES(), AggFunctions.RBM32())
+    .primaryKey("user_id")
+    .build();
+```
+
+</TabItem>
+</Tabs>
+
+### rbm64
+
+Aggregates serialized 64-bit RoaringBitmap values by union.
+
+- **Supported Data Types**: BYTES
+- **Behavior**: ORs incoming bitmaps with the accumulator
+- **Null Handling**: Null values are ignored
+
+**Example:**
+<Tabs>
+<TabItem value="flink-sql" label="Flink SQL" default>
+
+```sql
+CREATE TABLE session_interactions (
+    session_id BIGINT,
+    interaction_bitmap BYTES,
+    PRIMARY KEY (session_id) NOT ENFORCED
+) WITH (
+    'table.merge-engine' = 'aggregation',
+    'fields.interaction_bitmap.agg' = 'rbm64'
+);
+```
+
+</TabItem>
+<TabItem value="java-client" label="Java Client">
+
+```java
+Schema schema = Schema.newBuilder()
+    .column("session_id", DataTypes.BIGINT())
+    .column("interaction_bitmap", DataTypes.BYTES(), AggFunctions.RBM64())
+    .primaryKey("session_id")
+    .build();
 ```
 
 </TabItem>

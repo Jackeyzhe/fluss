@@ -60,6 +60,15 @@ public final class TableDescriptor implements Serializable {
     public static final String TIMESTAMP_COLUMN_NAME = "__timestamp";
     public static final String BUCKET_COLUMN_NAME = "__bucket";
 
+    // Reserved column names for virtual table metadata ($changelog and $binlog)
+    public static final String CHANGE_TYPE_COLUMN = "_change_type";
+    public static final String LOG_OFFSET_COLUMN = "_log_offset";
+    public static final String COMMIT_TIMESTAMP_COLUMN = "_commit_timestamp";
+
+    // column names for $binlog virtual table nested row fields
+    public static final String BEFORE_COLUMN = "before";
+    public static final String AFTER_COLUMN = "after";
+
     private final Schema schema;
     private final @Nullable String comment;
     private final List<String> partitionKeys;

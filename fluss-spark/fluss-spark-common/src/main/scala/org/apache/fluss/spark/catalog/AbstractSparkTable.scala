@@ -17,30 +17,40 @@
 
 package org.apache.fluss.spark.catalog
 
+import org.apache.fluss.client.admin.Admin
 import org.apache.fluss.config.{Configuration => FlussConfiguration}
 import org.apache.fluss.metadata.{TableInfo, TablePath}
 import org.apache.fluss.spark.SparkConversions
 
+import org.apache.spark.sql.CatalogV2UtilShim
 import org.apache.spark.sql.connector.catalog.{Table, TableCapability}
+import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.types.StructType
 
 import java.util
 
 import scala.collection.JavaConverters._
 
-abstract class AbstractSparkTable(tableInfo: TableInfo) extends Table {
-
+abstract class AbstractSparkTable(val admin: Admin, val tableInfo: TableInfo) extends Table {
   protected lazy val _schema: StructType =
     SparkConversions.toSparkDataType(tableInfo.getSchema.getRowType)
 
   protected lazy val _partitionSchema = new StructType(
-    _schema.fields.filter(tableInfo.getPartitionKeys.contains))
+    _schema.fields.filter(e => tableInfo.getPartitionKeys.contains(e.name)))
 
   override def name(): String = tableInfo.toString
 
   override def schema(): StructType = _schema
 
   override def capabilities(): util.Set[TableCapability] = {
-    Set(TableCapability.BATCH_WRITE).asJava
+    Set(
+      TableCapability.BATCH_READ,
+      TableCapability.BATCH_WRITE,
+      TableCapability.STREAMING_WRITE
+    ).asJava
+  }
+
+  override def partitioning(): Array[Transform] = {
+    CatalogV2UtilShim.toSparkTransforms(_partitionSchema.fields.map(_.name))
   }
 }

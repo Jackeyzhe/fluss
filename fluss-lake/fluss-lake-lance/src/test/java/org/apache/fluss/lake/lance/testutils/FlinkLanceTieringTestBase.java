@@ -78,9 +78,8 @@ public class FlinkLanceTieringTestBase {
 
     private static Configuration initConfig() {
         Configuration conf = new Configuration();
-        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofSeconds(1))
-                // not to clean snapshots for test purpose
-                .set(ConfigOptions.KV_MAX_RETAINED_SNAPSHOTS, Integer.MAX_VALUE);
+        // not to clean snapshots for test purpose
+        conf.set(ConfigOptions.KV_MAX_RETAINED_SNAPSHOTS, Integer.MAX_VALUE);
         conf.setString("datalake.format", "lance");
         try {
             warehousePath =
@@ -179,6 +178,25 @@ public class FlinkLanceTieringTestBase {
         return createTable(tablePath, tableBuilder.build());
     }
 
+    protected long createLogTableWithAllArrayTypes(TablePath tablePath) throws Exception {
+        Schema.Builder schemaBuilder =
+                Schema.newBuilder()
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.STRING())
+                        .column("tags", DataTypes.ARRAY(DataTypes.STRING()))
+                        .column("scores", DataTypes.ARRAY(DataTypes.INT()))
+                        .column("embedding", DataTypes.ARRAY(DataTypes.FLOAT()));
+
+        TableDescriptor.Builder tableBuilder =
+                TableDescriptor.builder()
+                        .distributedBy(1, "a")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500));
+
+        tableBuilder.schema(schemaBuilder.build());
+        return createTable(tablePath, tableBuilder.build());
+    }
+
     protected void writeRows(TablePath tablePath, List<InternalRow> rows, boolean append)
             throws Exception {
         try (Table table = conn.getTable(tablePath)) {
@@ -209,12 +227,5 @@ public class FlinkLanceTieringTestBase {
                         new Configuration(),
                         DataLakeFormat.LANCE.toString())
                 .build();
-    }
-
-    protected void waitUntilSnapshot(long tableId, int bucketNum, long snapshotId) {
-        for (int i = 0; i < bucketNum; i++) {
-            TableBucket tableBucket = new TableBucket(tableId, i);
-            FLUSS_CLUSTER_EXTENSION.waitUntilSnapshotFinished(tableBucket, snapshotId);
-        }
     }
 }

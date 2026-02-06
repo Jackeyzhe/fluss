@@ -45,6 +45,7 @@ import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
@@ -167,6 +168,7 @@ public final class Replica {
     private final AdjustIsrManager adjustIsrManager;
 
     private final SchemaGetter schemaGetter;
+    private final TableInfo tableInfo;
     private final TableConfig tableConfig;
     // logFormat and arrowCompressionInfo are used in hot-path, so cache them here.
     private final LogFormat logFormat;
@@ -240,6 +242,7 @@ public final class Replica {
                         tableInfo.getTableId(),
                         tableInfo.getSchemaId(),
                         tableInfo.getSchema());
+        this.tableInfo = tableInfo;
         this.tableConfig = tableInfo.getTableConfig();
         this.logFormat = tableConfig.getLogFormat();
         this.arrowCompressionInfo = tableConfig.getArrowCompressionInfo();
@@ -248,6 +251,7 @@ public final class Replica {
         this.closeableRegistry = new CloseableRegistry();
 
         this.logTablet = createLog(lazyHighWatermarkCheckpoint);
+        this.logTablet.updateIsDataLakeEnabled(tableConfig.isDataLakeEnabled());
         this.clock = clock;
         registerMetrics();
     }
@@ -300,6 +304,10 @@ public final class Replica {
 
     public int getCoordinatorEpoch() {
         return coordinatorEpoch;
+    }
+
+    public TableInfo getTableInfo() {
+        return tableInfo;
     }
 
     public @Nullable Integer getLeaderId() {
@@ -534,7 +542,7 @@ public final class Replica {
                 MetricNames.LOG_LAKE_PENDING_RECORDS,
                 () ->
                         getLakeLogEndOffset() < 0L
-                                ? -1
+                                ? getLogHighWatermark() - getLogStartOffset()
                                 : getLogHighWatermark() - getLakeLogEndOffset());
         lakeTieringMetricGroup.gauge(
                 MetricNames.LOG_LAKE_TIMESTAMP_LAG,
@@ -557,6 +565,32 @@ public final class Replica {
     @VisibleForTesting
     public void updateLeaderEndOffsetSnapshot() {
         logTablet.updateLeaderEndOffsetSnapshot();
+    }
+
+    public void updateIsDataLakeEnabled(boolean isDataLakeEnabled) {
+        boolean old = logTablet.isDataLakeEnabled();
+        if (old == isDataLakeEnabled) {
+            return;
+        }
+
+        logTablet.updateIsDataLakeEnabled(isDataLakeEnabled);
+
+        if (isLeader()) {
+            if (isDataLakeEnabled) {
+                registerLakeTieringMetrics();
+            } else {
+                if (lakeTieringMetricGroup != null) {
+                    lakeTieringMetricGroup.close();
+                    lakeTieringMetricGroup = null;
+                }
+            }
+        }
+
+        LOG.info(
+                "Replica for {} isDataLakeEnabled changed from {} to {}",
+                tableBucket,
+                old,
+                isDataLakeEnabled);
     }
 
     private void createKv() {
@@ -913,7 +947,10 @@ public final class Replica {
     }
 
     public LogAppendInfo putRecordsToLeader(
-            KvRecordBatch kvRecords, @Nullable int[] targetColumns, int requiredAcks)
+            KvRecordBatch kvRecords,
+            @Nullable int[] targetColumns,
+            MergeMode mergeMode,
+            int requiredAcks)
             throws Exception {
         return inReadLock(
                 leaderIsrUpdateLock,
@@ -931,7 +968,7 @@ public final class Replica {
                             kv, "KvTablet for the replica to put kv records shouldn't be null.");
                     LogAppendInfo logAppendInfo;
                     try {
-                        logAppendInfo = kv.putAsLeader(kvRecords, targetColumns);
+                        logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);
                     } catch (IOException e) {
                         LOG.error("Error while putting records to {}", tableBucket, e);
                         fatalErrorHandler.onFatalError(e);
@@ -1930,5 +1967,11 @@ public final class Replica {
     @VisibleForTesting
     public SchemaGetter getSchemaGetter() {
         return schemaGetter;
+    }
+
+    @VisibleForTesting
+    @Nullable
+    public PeriodicSnapshotManager getKvSnapshotManager() {
+        return kvSnapshotManager;
     }
 }

@@ -18,11 +18,11 @@
 package org.apache.fluss.flink.tiering.source.split;
 
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.initializer.BucketOffsetsRetrieverImpl;
+import org.apache.fluss.client.initializer.OffsetsInitializer.BucketOffsetsRetriever;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
-import org.apache.fluss.flink.source.enumerator.initializer.BucketOffsetsRetrieverImpl;
-import org.apache.fluss.flink.source.enumerator.initializer.OffsetsInitializer.BucketOffsetsRetriever;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -56,9 +56,8 @@ public class TieringSplitGenerator {
         this.flussAdmin = flussAdmin;
     }
 
-    public List<TieringSplit> generateTableSplits(TablePath tablePath) throws Exception {
-
-        final TableInfo tableInfo = flussAdmin.getTableInfo(tablePath).get();
+    public List<TieringSplit> generateTableSplits(TableInfo tableInfo) throws Exception {
+        TablePath tablePath = tableInfo.getTablePath();
         final BucketOffsetsRetriever bucketOffsetsRetriever =
                 new BucketOffsetsRetrieverImpl(flussAdmin, tablePath);
 
@@ -287,7 +286,7 @@ public class TieringSplitGenerator {
                                 latestBucketOffset,
                                 0));
             } else {
-                LOG.info(
+                LOG.debug(
                         "The lastCommittedBucketOffset {} is equals or bigger than latestBucketOffset {}, skip generating split for bucket {}",
                         lastCommittedBucketOffset,
                         latestBucketOffset,
@@ -320,8 +319,7 @@ public class TieringSplitGenerator {
                             tableBucket,
                             partitionName,
                             EARLIEST_OFFSET,
-                            latestBucketOffset,
-                            0));
+                            latestBucketOffset));
         } else {
             // the bucket has been tiered, scan remain fluss log
             if (lastCommittedBucketOffset < latestBucketOffset) {
@@ -331,11 +329,10 @@ public class TieringSplitGenerator {
                                 tableBucket,
                                 partitionName,
                                 lastCommittedBucketOffset,
-                                latestBucketOffset,
-                                0));
+                                latestBucketOffset));
             }
         }
-        LOG.info(
+        LOG.debug(
                 "The lastCommittedBucketOffset {} is equals or bigger than latestBucketOffset {}, skip generating split for bucket {}",
                 lastCommittedBucketOffset,
                 latestBucketOffset,

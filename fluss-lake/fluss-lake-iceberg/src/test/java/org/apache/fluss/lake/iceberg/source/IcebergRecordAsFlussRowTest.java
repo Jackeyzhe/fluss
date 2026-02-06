@@ -18,6 +18,8 @@
 
 package org.apache.fluss.lake.iceberg.source;
 
+import org.apache.fluss.row.InternalRow;
+
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
@@ -30,6 +32,8 @@ import java.nio.ByteBuffer;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
@@ -61,10 +65,32 @@ class IcebergRecordAsFlussRowTest {
                         optional(11, "timestamp_ltz", Types.TimestampType.withZone()),
                         optional(12, "binary_data", Types.BinaryType.get()),
                         optional(13, "char_data", Types.StringType.get()),
+                        optional(
+                                14,
+                                "nested_row",
+                                Types.StructType.of(
+                                        required(15, "city", Types.StringType.get()),
+                                        required(
+                                                16,
+                                                "address",
+                                                Types.StructType.of(
+                                                        required(
+                                                                17,
+                                                                "subfield1",
+                                                                Types.StringType.get()),
+                                                        required(
+                                                                18,
+                                                                "subfield2",
+                                                                Types.IntegerType.get()))))),
+                        optional(
+                                19,
+                                "map_field",
+                                Types.MapType.ofOptional(
+                                        20, 21, Types.StringType.get(), Types.IntegerType.get())),
                         // System columns
-                        required(14, "__bucket", Types.IntegerType.get()),
-                        required(15, "__offset", Types.LongType.get()),
-                        required(16, "__timestamp", Types.TimestampType.withZone()));
+                        required(22, "__bucket", Types.IntegerType.get()),
+                        required(23, "__offset", Types.LongType.get()),
+                        required(24, "__timestamp", Types.TimestampType.withZone()));
 
         record = GenericRecord.create(schema);
     }
@@ -82,7 +108,7 @@ class IcebergRecordAsFlussRowTest {
         icebergRecordAsFlussRow.replaceIcebergRecord(record);
 
         // Should return count excluding system columns (3 system columns)
-        assertThat(icebergRecordAsFlussRow.getFieldCount()).isEqualTo(13);
+        assertThat(icebergRecordAsFlussRow.getFieldCount()).isEqualTo(15);
     }
 
     @Test
@@ -145,6 +171,78 @@ class IcebergRecordAsFlussRowTest {
                 .isEqualTo("Hello"); // char_data
 
         // Test field count (excluding system columns)
-        assertThat(icebergRecordAsFlussRow.getFieldCount()).isEqualTo(13);
+        assertThat(icebergRecordAsFlussRow.getFieldCount()).isEqualTo(15);
+    }
+
+    @Test
+    void testNestedRow() {
+        String cityValue = "Seoul";
+        String subfield1Value = "string value";
+        Integer subfield2Value = 12345;
+        Record nestedRecord =
+                GenericRecord.create(record.struct().fields().get(13).type().asStructType());
+        nestedRecord.setField("city", "Seoul");
+
+        Record deepNestedRecord =
+                GenericRecord.create(nestedRecord.struct().fields().get(1).type().asStructType());
+        deepNestedRecord.setField("subfield1", subfield1Value);
+        deepNestedRecord.setField("subfield2", subfield2Value);
+
+        nestedRecord.setField("address", deepNestedRecord);
+
+        record.setField("nested_row", nestedRecord);
+        icebergRecordAsFlussRow.replaceIcebergRecord(record);
+
+        InternalRow nestedRow = icebergRecordAsFlussRow.getRow(13, 2);
+        assertThat(nestedRow).isNotNull();
+        assertThat(nestedRow.getString(0).toString()).isEqualTo(cityValue);
+
+        InternalRow deepNestedRow = nestedRow.getRow(1, 2);
+        assertThat(deepNestedRow).isNotNull();
+        assertThat(deepNestedRow.getString(0).toString()).isEqualTo(subfield1Value);
+        assertThat(deepNestedRow.getInt(1)).isEqualTo(subfield2Value);
+    }
+
+    @Test
+    void testMapType() {
+        // Create a simple map with String keys and Integer values
+        Map<String, Integer> mapData = new HashMap<>();
+        mapData.put("key1", 100);
+        mapData.put("key2", 200);
+        mapData.put("key3", 300);
+
+        record.setField("id", 1L);
+        record.setField("map_field", mapData);
+        // System columns
+        record.setField("__bucket", 1);
+        record.setField("__offset", 100L);
+        record.setField("__timestamp", OffsetDateTime.now(ZoneOffset.UTC));
+
+        icebergRecordAsFlussRow.replaceIcebergRecord(record);
+
+        // Test map retrieval - map_field is at index 14
+        org.apache.fluss.row.InternalMap internalMap = icebergRecordAsFlussRow.getMap(14);
+        assertThat(internalMap).isNotNull();
+        assertThat(internalMap.size()).isEqualTo(3);
+
+        // Verify map contents by iterating through keys and values
+        org.apache.fluss.row.InternalArray keyArray = internalMap.keyArray();
+        org.apache.fluss.row.InternalArray valueArray = internalMap.valueArray();
+
+        Map<String, Integer> resultMap = new HashMap<>();
+        for (int i = 0; i < internalMap.size(); i++) {
+            String key = keyArray.getString(i).toString();
+            int value = valueArray.getInt(i);
+            resultMap.put(key, value);
+        }
+
+        assertThat(resultMap).containsEntry("key1", 100);
+        assertThat(resultMap).containsEntry("key2", 200);
+        assertThat(resultMap).containsEntry("key3", 300);
+
+        // Test null map
+        record.setField("map_field", null);
+        icebergRecordAsFlussRow.replaceIcebergRecord(record);
+        assertThat(icebergRecordAsFlussRow.isNullAt(14)).isTrue();
     }
 }

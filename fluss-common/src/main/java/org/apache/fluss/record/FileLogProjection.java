@@ -51,9 +51,7 @@ import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 import static org.apache.fluss.record.DefaultLogRecordBatch.APPEND_ONLY_FLAG_MASK;
 import static org.apache.fluss.record.LogRecordBatchFormat.LENGTH_OFFSET;
@@ -101,7 +99,7 @@ public class FileLogProjection {
     private SchemaGetter schemaGetter;
     private long tableId;
     private ArrowCompressionInfo compressionInfo;
-    private int[] selectedFieldIds;
+    private int[] selectedFieldPositions;
 
     public FileLogProjection(ProjectionPushdownCache projectionsCache) {
         this.projectionsCache = projectionsCache;
@@ -117,11 +115,11 @@ public class FileLogProjection {
             long tableId,
             SchemaGetter schemaGetter,
             ArrowCompressionInfo compressionInfo,
-            int[] selectedFieldIds) {
+            int[] selectedFieldPositions) {
         this.tableId = tableId;
         this.schemaGetter = schemaGetter;
         this.compressionInfo = compressionInfo;
-        this.selectedFieldIds = selectedFieldIds;
+        this.selectedFieldPositions = selectedFieldPositions;
     }
 
     /**
@@ -142,7 +140,7 @@ public class FileLogProjection {
         // So we use V0 header size here for a conservative judgment. In the end, the condition
         // of (position >= end - recordBatchHeaderSize) will ensure the final correctness.
         while (maxBytes > V0_RECORD_BATCH_HEADER_SIZE) {
-            if (position >= end - V0_RECORD_BATCH_HEADER_SIZE) {
+            if (position > end - V0_RECORD_BATCH_HEADER_SIZE) {
                 // the remaining bytes in the file are not enough to read a batch header up to
                 // magic.
                 return new BytesViewLogRecords(builder.build());
@@ -168,10 +166,12 @@ public class FileLogProjection {
                 return new BytesViewLogRecords(builder.build());
             }
 
-            // Skip empty batch. The empty batch was generated when build cdc log batch when there
+            // Return empty batch to push forward log offset. The empty batch was generated when
+            // build cdc log batch when there
             // is no cdc log generated for this kv batch. See the comments about the field
             // 'lastOffsetDelta' in DefaultLogRecordBatch.
             if (batchSizeInBytes == recordBatchHeaderSize) {
+                builder.addBytes(channel, position, batchSizeInBytes);
                 position += batchSizeInBytes;
                 continue;
             }
@@ -405,19 +405,17 @@ public class FileLogProjection {
 
     private ProjectionInfo getOrCreateProjectionInfo(short schemaId) {
         ProjectionInfo cachedProjection =
-                projectionsCache.getProjectionInfo(tableId, schemaId, selectedFieldIds);
+                projectionsCache.getProjectionInfo(tableId, schemaId, selectedFieldPositions);
         if (cachedProjection == null) {
-            cachedProjection = createProjectionInfo(schemaId, selectedFieldIds);
+            cachedProjection = createProjectionInfo(schemaId, selectedFieldPositions);
             projectionsCache.setProjectionInfo(
-                    tableId, schemaId, selectedFieldIds, cachedProjection);
+                    tableId, schemaId, selectedFieldPositions, cachedProjection);
         }
         return cachedProjection;
     }
 
-    private ProjectionInfo createProjectionInfo(short schemaId, int[] selectedFieldIds) {
+    private ProjectionInfo createProjectionInfo(short schemaId, int[] selectedFieldPositions) {
         org.apache.fluss.metadata.Schema schema = schemaGetter.getSchema(schemaId);
-        int[] selectedFieldPositions =
-                selectedFieldPositions(schemaGetter.getSchema(schemaId), selectedFieldIds);
         RowType rowType = schema.getRowType();
 
         // initialize the projection util information
@@ -458,37 +456,6 @@ public class FileLogProjection {
                 metadataLength,
                 bodyCompression,
                 selectedFieldPositions);
-    }
-
-    int[] selectedFieldPositions(org.apache.fluss.metadata.Schema schema, int[] projectedFields) {
-        Map<Integer, Integer> columnIdPositions = new HashMap<>();
-        List<Integer> columnIds = schema.getColumnIds();
-        for (int i = 0; i < columnIds.size(); i++) {
-            columnIdPositions.put(columnIds.get(i), i);
-        }
-
-        int prev = -1;
-        int[] selectedFieldPositions = new int[projectedFields.length];
-        for (int i = 0; i < projectedFields.length; i++) {
-            int fieldId = projectedFields[i];
-            Integer position = columnIdPositions.get(fieldId);
-            if (position == null) {
-                throw new InvalidColumnProjectionException(
-                        String.format(
-                                "Projected field id %s is not contained in %s",
-                                fieldId, columnIds));
-            }
-
-            selectedFieldPositions[i] = position;
-            if (position < prev) {
-                throw new InvalidColumnProjectionException(
-                        "The projection indexes should be in field order, but is "
-                                + Arrays.toString(projectedFields));
-            }
-
-            prev = position;
-        }
-        return selectedFieldPositions;
     }
 
     /** Projection pushdown information for a specific schema and selected fields. */

@@ -55,6 +55,9 @@ import static org.apache.fluss.config.ConfigOptions.NoKeyAssigner.STICKY;
 public class ConfigOptions {
     public static final String DEFAULT_LISTENER_NAME = "FLUSS";
 
+    public static final int KV_FORMAT_VERSION_2 = 2;
+    public static final int CURRENT_KV_FORMAT_VERSION = KV_FORMAT_VERSION_2;
+
     @Internal
     public static final String[] PARENT_FIRST_LOGGING_PATTERNS =
             new String[] {
@@ -353,6 +356,28 @@ public class ConfigOptions {
                                     + "Increase this value if you experience slow unnecessary snapshot files clean. "
                                     + "The default value is 10. "
                                     + "This option is deprecated. Please use server.io-pool.size instead.");
+
+    /**
+     * The TTL (time-to-live) for producer offsets. Producer offsets older than this TTL will be
+     * automatically cleaned up by the coordinator server.
+     */
+    public static final ConfigOption<Duration> COORDINATOR_PRODUCER_OFFSETS_TTL =
+            key("coordinator.producer-offsets.ttl")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(24))
+                    .withDescription(
+                            "The TTL (time-to-live) for producer offsets. "
+                                    + "Producer offsets older than this TTL will be automatically cleaned up "
+                                    + "by the coordinator server. Default is 24 hours.");
+
+    /** The interval for cleaning up expired producer offsets and orphan files in remote storage. */
+    public static final ConfigOption<Duration> COORDINATOR_PRODUCER_OFFSETS_CLEANUP_INTERVAL =
+            key("coordinator.producer-offsets.cleanup-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(1))
+                    .withDescription(
+                            "The interval for cleaning up expired producer offsets "
+                                    + "and orphan files in remote storage. Default is 1 hour.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for Tablet Server
@@ -1283,6 +1308,27 @@ public class ConfigOptions {
                             "The format of the kv records in kv store. The default value is `compacted`. "
                                     + "The supported formats are `compacted` and `indexed`.");
 
+    /** The version of the KV format. */
+    public static final ConfigOption<Integer> TABLE_KV_FORMAT_VERSION =
+            key("table.kv.format-version")
+                    .intType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The version of the kv format. "
+                                    + "Automatically set by the coordinator during table creation if not configured by users. "
+                                    + "Note: The datalake encoding and bucketing strategy mentioned below only takes effect "
+                                    + "when 'datalake.format' is configured at cluster level. "
+                                    + "Version Behaviors: "
+                                    + "(1) Version 1: Tables created before 'table.kv.format-version' was introduced are treated as version 1. "
+                                    + "Uses datalake's encoder (e.g., Paimon/Iceberg) for both primary key and bucket key encoding. "
+                                    + "This may not support prefix lookup properly because some datalake encoders (like Paimon) "
+                                    + "don't guarantee that encoded bucket key bytes are a prefix of encoded primary key bytes. "
+                                    + "(2) Version 2 (current): New tables use Fluss's default encoder for primary key encoding "
+                                    + "when bucket key differs from primary key, which ensures proper prefix lookup support. "
+                                    + "When bucket key equals primary key (default bucket key), it still uses datalake's encoder "
+                                    + "for optimization (encoded bytes can be reused for bucket calculation). "
+                                    + "Bucket key encoding always uses datalake's encoder to align with datalake bucket calculation.");
+
     public static final ConfigOption<Boolean> TABLE_AUTO_PARTITION_ENABLED =
             key("table.auto-partition.enabled")
                     .booleanType()
@@ -1447,16 +1493,15 @@ public class ConfigOptions {
                                     + "For tables with FIRST_ROW, VERSIONED, or AGGREGATION merge engines, this option defaults to `ignore`. "
                                     + "Note: For AGGREGATION merge engine, when set to `allow`, delete operations will remove the entire record.");
 
-    public static final ConfigOption<String> TABLE_AUTO_INCREMENT_FIELDS =
-            key("table.auto-increment.fields")
-                    .stringType()
-                    .noDefaultValue()
+    public static final ConfigOption<Long> TABLE_AUTO_INCREMENT_CACHE_SIZE =
+            key("table.auto-increment.cache-size")
+                    .longType()
+                    .defaultValue(100000L)
                     .withDescription(
-                            "Defines the auto increment columns. "
-                                    + "The auto increment column can only be used in primary-key table."
-                                    + "With an auto increment column in the table, whenever a new row is inserted into the table, the new row will be assigned with the next available value from the auto-increment sequence."
-                                    + "The auto increment column can only be used in primary-key table. The data type of the auto increment column must be INT or BIGINT."
-                                    + "Currently a table can have only one auto-increment column.");
+                            "The cache size of auto-increment IDs fetched from the distributed counter each time. "
+                                    + "This value determines the length of the locally cached ID segment. Default: 100000. "
+                                    + "A larger cache size may cause significant auto-increment ID gaps, especially when unused cached ID segments are discarded due to TabletServer restarts or abnormal terminations. "
+                                    + "Conversely, a smaller cache size increases the frequency of ID fetch requests to the distributed counter, introducing extra network overhead and reducing write throughput and performance.");
 
     public static final ConfigOption<ChangelogImage> TABLE_CHANGELOG_IMAGE =
             key("table.changelog.image")
@@ -1468,7 +1513,7 @@ public class ConfigOptions {
                                     + "The supported modes are `FULL` (default) and `WAL`. "
                                     + "The `FULL` mode produces both UPDATE_BEFORE and UPDATE_AFTER records for update operations, capturing complete information about updates and allowing tracking of previous values. "
                                     + "The `WAL` mode does not produce UPDATE_BEFORE records. Only INSERT, UPDATE_AFTER (and DELETE if allowed) records are emitted. "
-                                    + "When WAL mode is enabled with default merge engine (no merge engine configured) and full row updates (not partial update), an optimization is applied to skip looking up old values, "
+                                    + "When WAL mode is enabled, the default merge engine is used (no merge engine configured), updates are full row updates (not partial update), and there is no auto-increment column, an optimization is applied to skip looking up old values, "
                                     + "and in this case INSERT operations are converted to UPDATE_AFTER events. "
                                     + "This mode reduces storage and transmission costs but loses the ability to track previous values. "
                                     + "This option only affects primary key tables.");
@@ -1740,6 +1785,45 @@ public class ConfigOptions {
                             "If true, RocksDB will use block-based filter instead of full filter, this only take effect when bloom filter is used. "
                                     + "The default value is `false`.");
 
+    public static final ConfigOption<Boolean> KV_CACHE_INDEX_AND_FILTER_BLOCKS =
+            key("kv.rocksdb.block.cache-index-and-filter-blocks")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, index and filter blocks will be stored in block cache, "
+                                    + "together with all other data blocks. This helps to limit memory usage "
+                                    + "so that the total memory used by RocksDB is bounded by block cache size. "
+                                    + "The default value is `false`.");
+
+    public static final ConfigOption<Boolean> KV_CACHE_INDEX_AND_FILTER_BLOCKS_WITH_HIGH_PRIORITY =
+            key("kv.rocksdb.block.cache-index-and-filter-blocks-with-high-priority")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true and cache_index_and_filter_blocks is enabled, "
+                                    + "index and filter blocks will be stored with high priority in block cache, "
+                                    + "making them less likely to be evicted than data blocks. "
+                                    + "The default value is `false`.");
+
+    public static final ConfigOption<Boolean> KV_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE =
+            key("kv.rocksdb.block.pin-l0-filter-and-index-blocks-in-cache")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true and cache_index_and_filter_blocks is enabled, "
+                                    + "L0 index and filter blocks will be pinned in block cache and will not be evicted. "
+                                    + "This helps avoid performance degradation due to cache misses on L0 index/filter blocks. "
+                                    + "The default value is `false`.");
+
+    public static final ConfigOption<Boolean> KV_PIN_TOP_LEVEL_INDEX_AND_FILTER =
+            key("kv.rocksdb.block.pin-top-level-index-and-filter")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "If true, the top-level index of partitioned index/filter blocks will be pinned "
+                                    + "in block cache and will not be evicted. "
+                                    + "The default value is `false`.");
+
     // ------------------------------------------------------------------------
     //  ConfigOptions for Kv recovering
     // ------------------------------------------------------------------------
@@ -1772,6 +1856,55 @@ public class ConfigOptions {
                                     + "on one host (e.g. when one TabletServer is colocated with "
                                     + "the CoordinatorServer) it is advisable to use a port range "
                                     + "like 9250-9260.");
+
+    // ------------------------------------------------------------------------
+    //  ConfigOptions for prometheus push gateway reporter
+    // ------------------------------------------------------------------------
+    public static final ConfigOption<String> METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_HOST_URL =
+            key("metrics.reporter.prometheus-push.host-url")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The PushGateway server host URL including scheme, host name, and port.");
+
+    public static final ConfigOption<String> METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_JOB_NAME =
+            key("metrics.reporter.prometheus-push.job-name")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("The job name under which metrics will be pushed");
+
+    public static final ConfigOption<Boolean>
+            METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_RANDOM_JOB_NAME_SUFFIX =
+                    key("metrics.reporter.prometheus-push.random-job-name-suffix")
+                            .booleanType()
+                            .defaultValue(true)
+                            .withDescription(
+                                    "Specifies whether a random suffix should be appended to the job name. "
+                                            + "This is useful when multiple instances of the reporter "
+                                            + "are running on the same host.");
+
+    public static final ConfigOption<Boolean>
+            METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_DELETE_ON_SHUTDOWN =
+                    key("metrics.reporter.prometheus-push.delete-on-shutdown")
+                            .booleanType()
+                            .defaultValue(true)
+                            .withDescription(
+                                    "Specifies whether to delete metrics from the PushGateway on shutdown. Fluss will try its best to delete the metrics but this is not guaranteed.");
+
+    public static final ConfigOption<String> METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_GROUPING_KEY =
+            key("metrics.reporter.prometheus-push.grouping-key")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Specifies the grouping key which is the group and global labels of all metrics. The label name and value are separated by '=', and labels are separated by ';', e.g., k1=v1;k2=v2.");
+
+    public static final ConfigOption<Duration>
+            METRICS_REPORTER_PROMETHEUS_PUSHGATEWAY_PUSH_INTERVAL =
+                    key("metrics.reporter.prometheus-push.push-interval")
+                            .durationType()
+                            .defaultValue(Duration.ofSeconds(10))
+                            .withDescription(
+                                    "The interval of pushing metrics to Prometheus PushGateway.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for jmx reporter

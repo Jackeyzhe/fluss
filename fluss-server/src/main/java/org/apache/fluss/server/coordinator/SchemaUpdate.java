@@ -17,59 +17,39 @@
 
 package org.apache.fluss.server.coordinator;
 
+import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.SchemaChangeException;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableChange;
-import org.apache.fluss.metadata.TableInfo;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /** Schema update. */
 public class SchemaUpdate {
 
     /** Apply schema changes to the given table info and return the updated schema. */
-    public static Schema applySchemaChanges(TableInfo tableInfo, List<TableChange> changes) {
-        SchemaUpdate schemaUpdate = new SchemaUpdate(tableInfo);
+    public static Schema applySchemaChanges(Schema initialSchema, List<TableChange> changes) {
+        SchemaUpdate schemaUpdate = new SchemaUpdate(initialSchema);
         for (TableChange change : changes) {
             schemaUpdate = schemaUpdate.applySchemaChange(change);
         }
         return schemaUpdate.getSchema();
     }
 
-    private final List<Schema.Column> columns;
-    private final AtomicInteger highestFieldId;
-    private final List<String> primaryKeys;
-    private final Map<String, Schema.Column> existedColumns;
+    // Now we only maintain the Builder
+    private final Schema.Builder builder;
 
-    public SchemaUpdate(TableInfo tableInfo) {
-        this.columns = new ArrayList<>();
-        this.existedColumns = new HashMap<>();
-        this.highestFieldId = new AtomicInteger(tableInfo.getSchema().getHighestFieldId());
-        this.primaryKeys = tableInfo.getPrimaryKeys();
-        this.columns.addAll(tableInfo.getSchema().getColumns());
-        for (Schema.Column column : columns) {
-            existedColumns.put(column.getName(), column);
-        }
+    public SchemaUpdate(Schema initialSchema) {
+        // Initialize builder from the current table schema
+        this.builder = Schema.newBuilder().fromSchema(initialSchema);
     }
 
     public Schema getSchema() {
-        Schema.Builder builder =
-                Schema.newBuilder()
-                        .fromColumns(columns)
-                        .highestFieldId((short) highestFieldId.get());
-        if (!primaryKeys.isEmpty()) {
-            builder.primaryKey(primaryKeys);
-        }
-
+        // Validation and building are now delegated
         return builder.build();
     }
 
-    public SchemaUpdate applySchemaChange(TableChange columnChange) {
+    private SchemaUpdate applySchemaChange(TableChange columnChange) {
         if (columnChange instanceof TableChange.AddColumn) {
             return addColumn((TableChange.AddColumn) columnChange);
         } else if (columnChange instanceof TableChange.ModifyColumn) {
@@ -84,20 +64,15 @@ public class SchemaUpdate {
     }
 
     private SchemaUpdate addColumn(TableChange.AddColumn addColumn) {
-        Schema.Column existingColumn = existedColumns.get(addColumn.getName());
+        // Use the builder to check if column exists
+        Schema.Column existingColumn = builder.getColumn(addColumn.getName()).orElse(null);
+
         if (existingColumn != null) {
-            // Allow idempotent retries: if column name/type/comment match existing, treat as no-op
-            if (!existingColumn.getDataType().equals(addColumn.getDataType())
-                    || !Objects.equals(
-                            existingColumn.getComment().orElse(null), addColumn.getComment())) {
-                throw new IllegalArgumentException(
-                        "Column " + addColumn.getName() + " already exists.");
-            }
-            return this;
+            throw new InvalidAlterTableException(
+                    "Column " + addColumn.getName() + " already exists.");
         }
 
-        TableChange.ColumnPosition position = addColumn.getPosition();
-        if (position != TableChange.ColumnPosition.last()) {
+        if (addColumn.getPosition() != TableChange.ColumnPosition.last()) {
             throw new IllegalArgumentException("Only support addColumn column at last now.");
         }
 
@@ -106,14 +81,15 @@ public class SchemaUpdate {
                     "Column " + addColumn.getName() + " must be nullable.");
         }
 
-        Schema.Column newColumn =
-                new Schema.Column(
-                        addColumn.getName(),
-                        addColumn.getDataType(),
-                        addColumn.getComment(),
-                        (byte) highestFieldId.incrementAndGet());
-        columns.add(newColumn);
-        existedColumns.put(newColumn.getName(), newColumn);
+        // Delegate the actual addition to the builder
+        builder.column(addColumn.getName(), addColumn.getDataType());
+
+        // Fixed: Use null check for the String comment
+        String comment = addColumn.getComment();
+        if (comment != null) {
+            builder.withComment(comment);
+        }
+
         return this;
     }
 

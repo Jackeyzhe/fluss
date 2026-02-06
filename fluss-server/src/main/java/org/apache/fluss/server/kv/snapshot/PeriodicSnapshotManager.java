@@ -38,6 +38,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -78,6 +79,14 @@ public class PeriodicSnapshotManager implements Closeable {
 
     /** Whether snapshot is started. */
     private volatile boolean started = false;
+
+    /**
+     * The scheduled snapshot task.
+     *
+     * <p>Since all reads and writes of {@code scheduledTask} are protected by synchronized, the
+     * volatile modifier is not necessary here.
+     */
+    private ScheduledFuture<?> scheduledTask = null;
 
     private final long initialDelay;
     /** The table bucket that the snapshot manager is for. */
@@ -164,8 +173,14 @@ public class PeriodicSnapshotManager implements Closeable {
                     "TableBucket {} schedules the next snapshot in {} seconds",
                     tableBucket,
                     delay / 1000);
-            periodicExecutor.schedule(this::triggerSnapshot, delay, TimeUnit.MILLISECONDS);
+            scheduledTask =
+                    periodicExecutor.schedule(this::triggerSnapshot, delay, TimeUnit.MILLISECONDS);
         }
+    }
+
+    @VisibleForTesting
+    public long currentSnapshotId() {
+        return target.currentSnapshotId();
     }
 
     public void triggerSnapshot() {
@@ -229,8 +244,11 @@ public class PeriodicSnapshotManager implements Closeable {
                                             snapshotLocation,
                                             snapshotResult);
                                     LOG.info(
-                                            "TableBucket {} snapshot finished successfully, cost {} ms.",
+                                            "TableBucket {} snapshot {} finished successfully, full size: {}, incremental size: {}, cost: {} ms.",
                                             tableBucket,
+                                            snapshotId,
+                                            snapshotResult.getSnapshotSize(),
+                                            snapshotResult.getIncrementalSize(),
                                             System.currentTimeMillis() - triggerTime);
                                 } catch (Throwable t) {
                                     LOG.warn(
@@ -312,6 +330,10 @@ public class PeriodicSnapshotManager implements Closeable {
     /** {@link SnapshotRunnable} provider and consumer. */
     @NotThreadSafe
     public interface SnapshotTarget {
+
+        /** Gets current snapshot id. */
+        long currentSnapshotId();
+
         /**
          * Initialize kv snapshot.
          *
@@ -350,6 +372,10 @@ public class PeriodicSnapshotManager implements Closeable {
         synchronized (this) {
             // do-nothing, please make the periodicExecutor will be closed by external
             started = false;
+            // cancel the scheduled task if not completed yet
+            if (scheduledTask != null && !scheduledTask.isDone()) {
+                scheduledTask.cancel(true);
+            }
         }
     }
 

@@ -20,10 +20,12 @@ package org.apache.fluss.lake.iceberg.source;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.Decimal;
 import org.apache.fluss.row.GenericArray;
+import org.apache.fluss.row.GenericMap;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 
+import org.apache.iceberg.data.Record;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
 
@@ -292,5 +294,273 @@ class FlussRowAsIcebergRecordTest {
 
         // Test null array
         assertThat(record.get(14)).isNull();
+    }
+
+    @Test
+    void testNestedRow() {
+        Types.StructType structType =
+                Types.StructType.of(
+                        // simple row
+                        Types.NestedField.required(
+                                0,
+                                "simple_row",
+                                Types.StructType.of(
+                                        Types.NestedField.required(
+                                                1, "id", Types.IntegerType.get()),
+                                        Types.NestedField.required(
+                                                2, "name", Types.StringType.get()))),
+                        // nested row
+                        Types.NestedField.required(
+                                3,
+                                "nested_row",
+                                Types.StructType.of(
+                                        Types.NestedField.required(
+                                                4, "id", Types.IntegerType.get()),
+                                        Types.NestedField.required(
+                                                5,
+                                                "inner",
+                                                Types.StructType.of(
+                                                        Types.NestedField.required(
+                                                                6, "val", Types.DoubleType.get()),
+                                                        Types.NestedField.required(
+                                                                7,
+                                                                "flag",
+                                                                Types.BooleanType.get()))))),
+                        // array row
+                        Types.NestedField.required(
+                                8,
+                                "array_row",
+                                Types.StructType.of(
+                                        Types.NestedField.required(
+                                                9,
+                                                "ids",
+                                                Types.ListType.ofRequired(
+                                                        10, Types.IntegerType.get())))),
+                        // nullable row
+                        Types.NestedField.optional(
+                                11,
+                                "nullable_row",
+                                Types.StructType.of(
+                                        Types.NestedField.required(
+                                                12, "id", Types.IntegerType.get()))));
+
+        RowType flussRowType =
+                RowType.of(
+                        // simple row
+                        DataTypes.ROW(
+                                DataTypes.FIELD("id", DataTypes.INT()),
+                                DataTypes.FIELD("name", DataTypes.STRING())),
+                        // nested row
+                        DataTypes.ROW(
+                                DataTypes.FIELD("id", DataTypes.INT()),
+                                DataTypes.FIELD(
+                                        "inner",
+                                        DataTypes.ROW(
+                                                DataTypes.FIELD("val", DataTypes.DOUBLE()),
+                                                DataTypes.FIELD("flag", DataTypes.BOOLEAN())))),
+                        // row_with array
+                        DataTypes.ROW(DataTypes.FIELD("ids", DataTypes.ARRAY(DataTypes.INT()))),
+                        // nullable row
+                        DataTypes.ROW(DataTypes.FIELD("id", DataTypes.INT())));
+
+        GenericRow genericRow = new GenericRow(4);
+
+        // Simple Row
+        GenericRow simpleRow = new GenericRow(2);
+        simpleRow.setField(0, 100);
+        simpleRow.setField(1, BinaryString.fromString("fluss"));
+        genericRow.setField(0, simpleRow);
+
+        // Nested Row
+        GenericRow innerRow = new GenericRow(2);
+        innerRow.setField(0, 3.14);
+        innerRow.setField(1, true);
+        GenericRow nestedRow = new GenericRow(2);
+        nestedRow.setField(0, 200);
+        nestedRow.setField(1, innerRow);
+        genericRow.setField(1, nestedRow);
+
+        // Array Row
+        GenericRow rowWithArray = new GenericRow(1);
+        rowWithArray.setField(0, new GenericArray(new int[] {1, 2, 3}));
+        genericRow.setField(2, rowWithArray);
+
+        // Nullable Row
+        genericRow.setField(3, null);
+
+        FlussRowAsIcebergRecord record = new FlussRowAsIcebergRecord(structType, flussRowType);
+        record.internalRow = genericRow;
+
+        // Verify Simple Row
+        Record icebergSimpleRow = (Record) record.get(0);
+        assertThat(icebergSimpleRow.get(0)).isEqualTo(100);
+        assertThat(icebergSimpleRow.get(1)).isEqualTo("fluss");
+
+        // Verify Nested Row
+        Record icebergNestedRow = (Record) record.get(1);
+        assertThat(icebergNestedRow.get(0)).isEqualTo(200);
+        Record icebergInnerRow = (Record) icebergNestedRow.get(1);
+        assertThat(icebergInnerRow.get(0)).isEqualTo(3.14);
+        assertThat(icebergInnerRow.get(1)).isEqualTo(true);
+
+        // Verify Row with Array
+        Record icebergRowWithArray = (Record) record.get(2);
+        List<?> ids = (List<?>) icebergRowWithArray.get(0);
+        assertThat(ids.size()).isEqualTo(3);
+        assertThat(ids.get(0)).isEqualTo(1);
+        assertThat(ids.get(1)).isEqualTo(2);
+        assertThat(ids.get(2)).isEqualTo(3);
+
+        // Verify Nullable Row
+        assertThat(record.get(3)).isNull();
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void testMapType() {
+        Types.StructType structType =
+                Types.StructType.of(
+                        // simple map
+                        Types.NestedField.required(
+                                0,
+                                "simple_map",
+                                Types.MapType.ofRequired(
+                                        1, 2, Types.StringType.get(), Types.IntegerType.get())),
+                        // nested map
+                        Types.NestedField.required(
+                                3,
+                                "nested_map",
+                                Types.MapType.ofRequired(
+                                        4,
+                                        5,
+                                        Types.StringType.get(),
+                                        Types.MapType.ofRequired(
+                                                6,
+                                                7,
+                                                Types.StringType.get(),
+                                                Types.IntegerType.get()))),
+                        // map in array
+                        Types.NestedField.required(
+                                8,
+                                "map_array",
+                                Types.ListType.ofRequired(
+                                        9,
+                                        Types.MapType.ofRequired(
+                                                10,
+                                                11,
+                                                Types.StringType.get(),
+                                                Types.IntegerType.get()))),
+                        // nullable map
+                        Types.NestedField.optional(
+                                12,
+                                "nullable_map",
+                                Types.MapType.ofRequired(
+                                        13, 14, Types.StringType.get(), Types.IntegerType.get())));
+
+        RowType flussRowType =
+                RowType.of(
+                        // simple map
+                        DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()),
+                        // nested map
+                        DataTypes.MAP(
+                                DataTypes.STRING(),
+                                DataTypes.MAP(DataTypes.STRING(), DataTypes.INT())),
+                        // map in array
+                        DataTypes.ARRAY(DataTypes.MAP(DataTypes.STRING(), DataTypes.INT())),
+                        // nullable map
+                        DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()));
+
+        GenericRow genericRow = new GenericRow(4);
+
+        // Simple Map
+        GenericMap simpleMap =
+                new GenericMap(
+                        new java.util.HashMap<Object, Object>() {
+                            {
+                                put(BinaryString.fromString("key1"), 100);
+                                put(BinaryString.fromString("key2"), 200);
+                            }
+                        });
+        genericRow.setField(0, simpleMap);
+
+        // Nested Map
+        GenericMap innerMap1 =
+                new GenericMap(
+                        new java.util.HashMap<Object, Object>() {
+                            {
+                                put(BinaryString.fromString("inner_a"), 1);
+                                put(BinaryString.fromString("inner_b"), 2);
+                            }
+                        });
+        GenericMap innerMap2 =
+                new GenericMap(
+                        new java.util.HashMap<Object, Object>() {
+                            {
+                                put(BinaryString.fromString("inner_c"), 3);
+                            }
+                        });
+        GenericMap nestedMap =
+                new GenericMap(
+                        new java.util.HashMap<Object, Object>() {
+                            {
+                                put(BinaryString.fromString("outer_1"), innerMap1);
+                                put(BinaryString.fromString("outer_2"), innerMap2);
+                            }
+                        });
+        genericRow.setField(1, nestedMap);
+
+        // Map in Array
+        GenericMap arrayMap1 =
+                new GenericMap(
+                        new java.util.HashMap<Object, Object>() {
+                            {
+                                put(BinaryString.fromString("a"), 10);
+                            }
+                        });
+        GenericMap arrayMap2 =
+                new GenericMap(
+                        new java.util.HashMap<Object, Object>() {
+                            {
+                                put(BinaryString.fromString("b"), 20);
+                            }
+                        });
+        genericRow.setField(2, new GenericArray(new Object[] {arrayMap1, arrayMap2}));
+
+        // Nullable Map
+        genericRow.setField(3, null);
+
+        FlussRowAsIcebergRecord record = new FlussRowAsIcebergRecord(structType, flussRowType);
+        record.internalRow = genericRow;
+
+        // Verify Simple Map
+        java.util.Map<Object, Object> simpleMapResult =
+                (java.util.Map<Object, Object>) record.get(0);
+        assertThat(simpleMapResult).isNotNull();
+        assertThat(simpleMapResult).containsEntry("key1", 100).containsEntry("key2", 200);
+
+        // Verify Nested Map
+        java.util.Map<Object, Object> nestedMapResult =
+                (java.util.Map<Object, Object>) record.get(1);
+        assertThat(nestedMapResult).isNotNull();
+        assertThat(nestedMapResult).hasSize(2);
+        java.util.Map<Object, Object> inner1 =
+                (java.util.Map<Object, Object>) nestedMapResult.get("outer_1");
+        assertThat(inner1).containsEntry("inner_a", 1).containsEntry("inner_b", 2);
+        java.util.Map<Object, Object> inner2 =
+                (java.util.Map<Object, Object>) nestedMapResult.get("outer_2");
+        assertThat(inner2).containsEntry("inner_c", 3);
+
+        // Verify Map in Array
+        List<?> mapArrayResult = (List<?>) record.get(2);
+        assertThat(mapArrayResult).hasSize(2);
+        java.util.Map<Object, Object> firstArrayMap =
+                (java.util.Map<Object, Object>) mapArrayResult.get(0);
+        assertThat(firstArrayMap).containsEntry("a", 10);
+        java.util.Map<Object, Object> secondArrayMap =
+                (java.util.Map<Object, Object>) mapArrayResult.get(1);
+        assertThat(secondArrayMap).containsEntry("b", 20);
+
+        // Verify Nullable Map
+        assertThat(record.get(3)).isNull();
     }
 }

@@ -18,11 +18,11 @@
 package org.apache.fluss.flink.lake;
 
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
-import org.apache.fluss.flink.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.fluss.flink.source.split.LogSplit;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
 import org.apache.fluss.lake.source.LakeSource;
@@ -119,7 +119,7 @@ public class LakeSplitGenerator {
                     lakeSplits, isLogTable, tableBucketsOffset, partitionNameById);
         } else {
             Map<Integer, List<LakeSplit>> nonPartitionLakeSplits =
-                    lakeSplits.values().iterator().next();
+                    lakeSplits.isEmpty() ? null : lakeSplits.values().iterator().next();
             // non-partitioned table
             return generateNoPartitionedTableSplit(
                     nonPartitionLakeSplits, isLogTable, tableBucketsOffset);
@@ -307,7 +307,7 @@ public class LakeSplitGenerator {
     }
 
     private List<SourceSplitBase> generateNoPartitionedTableSplit(
-            Map<Integer, List<LakeSplit>> lakeSplits,
+            @Nullable Map<Integer, List<LakeSplit>> lakeSplits,
             boolean isLogTable,
             Map<TableBucket, Long> tableBucketSnapshotLogOffset) {
         // iterate all bucket

@@ -55,6 +55,7 @@ import org.apache.fluss.fs.FsPathAndFileName;
 import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
+import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
@@ -71,6 +72,7 @@ import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.ServerTags;
+import org.apache.fluss.types.DataTypeChecks;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -93,6 +95,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_ENABLED;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
@@ -182,11 +185,14 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         long timestampAfterCreate = System.currentTimeMillis();
         TableInfo tableInfo = admin.getTableInfo(DEFAULT_TABLE_PATH).get();
         assertThat(tableInfo.getSchemaId()).isEqualTo(schemaInfo.getSchemaId());
+        TableDescriptor tableDescriptor =
+                DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
+        Map<String, String> options = new HashMap<>(tableDescriptor.getProperties());
+        options.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                String.valueOf(CURRENT_KV_FORMAT_VERSION));
         assertThat(tableInfo.toTableDescriptor())
-                .isEqualTo(
-                        DEFAULT_TABLE_DESCRIPTOR
-                                .withReplicationFactor(3)
-                                .withDataLakeFormat(PAIMON));
+                .isEqualTo(tableDescriptor.withProperties(options));
         assertThat(schemaInfo2).isEqualTo(schemaInfo);
         assertThat(tableInfo.getCreatedTime()).isEqualTo(tableInfo.getModifiedTime());
         assertThat(tableInfo.getCreatedTime()).isLessThan(timestampAfterCreate);
@@ -207,11 +213,14 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         tableInfo = admin.getTableInfo(tablePath).get();
         timestampAfterCreate = System.currentTimeMillis();
         assertThat(tableInfo.getSchemaId()).isEqualTo(schemaInfo.getSchemaId());
-        assertThat(tableInfo.toTableDescriptor())
-                .isEqualTo(
-                        DEFAULT_TABLE_DESCRIPTOR
-                                .withReplicationFactor(3)
-                                .withDataLakeFormat(PAIMON));
+
+        TableDescriptor expected =
+                DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
+        options = new HashMap<>(expected.getProperties());
+        options.put(
+                ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                String.valueOf(CURRENT_KV_FORMAT_VERSION));
+        assertThat(tableInfo.toTableDescriptor()).isEqualTo(expected.withProperties(options));
         assertThat(schemaInfo2).isEqualTo(schemaInfo);
         // assert created time
         assertThat(tableInfo.getCreatedTime())
@@ -394,7 +403,12 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
 
         admin.alterTable(
                         tablePath,
-                        Collections.singletonList(
+                        Arrays.asList(
+                                TableChange.addColumn(
+                                        "nested_row",
+                                        DataTypes.ROW(DataTypes.STRING(), DataTypes.INT()),
+                                        "new nested column",
+                                        TableChange.ColumnPosition.last()),
                                 TableChange.addColumn(
                                         "c1",
                                         DataTypes.STRING(),
@@ -408,23 +422,44 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                         .primaryKey("id")
                         .fromColumns(
                                 Arrays.asList(
+                                        new Schema.Column("id", DataTypes.INT(), "person id", 0),
                                         new Schema.Column(
-                                                "id", DataTypes.INT(), "person id", (short) 0),
+                                                "name", DataTypes.STRING(), "person name", 1),
+                                        new Schema.Column("age", DataTypes.INT(), "person age", 2),
                                         new Schema.Column(
-                                                "name",
-                                                DataTypes.STRING(),
-                                                "person name",
-                                                (short) 1),
+                                                "nested_row",
+                                                DataTypes.ROW(
+                                                        DataTypes.FIELD(
+                                                                "f0", DataTypes.STRING(), 4),
+                                                        DataTypes.FIELD("f1", DataTypes.INT(), 5)),
+                                                "new nested column",
+                                                3),
                                         new Schema.Column(
-                                                "age", DataTypes.INT(), "person age", (short) 2),
-                                        new Schema.Column(
-                                                "c1",
-                                                DataTypes.STRING(),
-                                                "new column c1",
-                                                (short) 3)))
+                                                "c1", DataTypes.STRING(), "new column c1", 6)))
                         .build();
         SchemaInfo schemaInfo = admin.getTableSchema(tablePath).get();
         assertThat(schemaInfo).isEqualTo(new SchemaInfo(expectedSchema, 2));
+        // test field_id of rowType
+        assertThat(
+                        DataTypeChecks.equalsWithFieldId(
+                                schemaInfo.getSchema().getRowType(), expectedSchema.getRowType()))
+                .isTrue();
+
+        assertThatThrownBy(
+                        () ->
+                                admin.alterTable(
+                                                tablePath,
+                                                Collections.singletonList(
+                                                        TableChange.addColumn(
+                                                                "nested_row",
+                                                                DataTypes.ROW(
+                                                                        DataTypes.STRING(),
+                                                                        DataTypes.INT()),
+                                                                "new nested column",
+                                                                TableChange.ColumnPosition.last())),
+                                                false)
+                                        .get())
+                .hasMessageContaining("Column nested_row already exists");
     }
 
     @Test
@@ -763,11 +798,13 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         try (Connection conn = ConnectionFactory.createConnection(clientConf);
                 Admin admin = conn.getAdmin()) {
             TableInfo tableInfo = admin.getTableInfo(DEFAULT_TABLE_PATH).get();
-            assertThat(tableInfo.toTableDescriptor())
-                    .isEqualTo(
-                            DEFAULT_TABLE_DESCRIPTOR
-                                    .withReplicationFactor(3)
-                                    .withDataLakeFormat(PAIMON));
+            TableDescriptor expected =
+                    DEFAULT_TABLE_DESCRIPTOR.withReplicationFactor(3).withDataLakeFormat(PAIMON);
+            Map<String, String> options = new HashMap<>(expected.getProperties());
+            options.put(
+                    ConfigOptions.TABLE_KV_FORMAT_VERSION.key(),
+                    String.valueOf(CURRENT_KV_FORMAT_VERSION));
+            assertThat(tableInfo.toTableDescriptor()).isEqualTo(expected.withProperties(options));
         }
     }
 
@@ -838,11 +875,27 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         admin.createDatabase("db3", DatabaseDescriptor.EMPTY, true).get();
         assertThat(admin.listDatabases().get())
                 .containsExactlyInAnyOrder("test_db", "db1", "db2", "db3", "fluss");
+        Map<String, Integer> databaseSummaries =
+                admin.listDatabaseSummaries().get().stream()
+                        .collect(
+                                Collectors.toMap(
+                                        DatabaseSummary::getDatabaseName,
+                                        DatabaseSummary::getTableCount));
+        assertThat(databaseSummaries.get("db1")).isEqualTo(0);
+        assertThat(databaseSummaries.get("db2")).isEqualTo(0);
 
         admin.createTable(TablePath.of("db1", "table1"), DEFAULT_TABLE_DESCRIPTOR, true).get();
         admin.createTable(TablePath.of("db1", "table2"), DEFAULT_TABLE_DESCRIPTOR, true).get();
         assertThat(admin.listTables("db1").get()).containsExactlyInAnyOrder("table1", "table2");
         assertThat(admin.listTables("db2").get()).isEmpty();
+        databaseSummaries =
+                admin.listDatabaseSummaries().get().stream()
+                        .collect(
+                                Collectors.toMap(
+                                        DatabaseSummary::getDatabaseName,
+                                        DatabaseSummary::getTableCount));
+        assertThat(databaseSummaries.get("db1")).isEqualTo(1);
+        assertThat(databaseSummaries.get("db2")).isEqualTo(0);
 
         assertThatThrownBy(() -> admin.listTables("unknown_db").get())
                 .cause()
@@ -990,8 +1043,8 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
             Map<Integer, CompletedSnapshot> expectedSnapshots = new HashMap<>();
             for (int bucket = 0; bucket < bucketNum; bucket++) {
                 CompletedSnapshot completedSnapshot =
-                        FLUSS_CLUSTER_EXTENSION.waitUntilSnapshotFinished(
-                                new TableBucket(tableId, bucket), 0);
+                        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(
+                                new TableBucket(tableId, bucket));
                 expectedSnapshots.put(bucket, completedSnapshot);
             }
 
@@ -1007,7 +1060,7 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
             TableBucket tb = new TableBucket(snapshots.getTableId(), 0);
             // wait until the snapshot finish
             expectedSnapshots.put(
-                    tb.getBucket(), FLUSS_CLUSTER_EXTENSION.waitUntilSnapshotFinished(tb, 1));
+                    tb.getBucket(), FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb));
 
             // check snapshot
             snapshots = admin.getLatestKvSnapshots(tablePath1).get();
@@ -1484,6 +1537,33 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                                 + "because they are reserved system columns in Fluss. "
                                 + "Please use other names for these columns. "
                                 + "The reserved system columns are: __offset, __timestamp, __bucket");
+
+        // Test changelog virtual table metadata columns are also reserved
+        TableDescriptor changelogColumnsDescriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("f0", DataTypes.STRING())
+                                        .column("_change_type", DataTypes.STRING())
+                                        .column("_log_offset", DataTypes.BIGINT())
+                                        .column("_commit_timestamp", DataTypes.TIMESTAMP())
+                                        .build())
+                        .distributedBy(1)
+                        .build();
+
+        TablePath changelogTablePath = TablePath.of(dbName, "test_changelog_columns");
+
+        assertThatThrownBy(
+                        () ->
+                                admin.createTable(
+                                                changelogTablePath,
+                                                changelogColumnsDescriptor,
+                                                false)
+                                        .get())
+                .cause()
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining(
+                        "_change_type, _log_offset, _commit_timestamp cannot be used as column names");
     }
 
     @Test
